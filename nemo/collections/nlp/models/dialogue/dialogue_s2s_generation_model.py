@@ -32,22 +32,20 @@ from nemo.collections.nlp.models.language_modeling.megatron_t5_model import Mega
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
-
-try:
-    from apex.transformer.pipeline_parallel.utils import _reconfigure_microbatch_calculator
-
-    HAVE_APEX = True
-except:
-    HAVE_APEX = False
-
+from nemo.utils.apex_utils import _reconfigure_microbatch_calculator
+from nemo.utils.decorators import deprecated_warning
 
 __all__ = ['DialogueS2SGenerationModel']
 
 
 class DialogueS2SGenerationModel(NLPModel):
     def __init__(
-        self, cfg: DictConfig, trainer: Trainer = None,
+        self,
+        cfg: DictConfig,
+        trainer: Trainer = None,
     ):
+        # deprecation warning
+        deprecated_warning("DialogueS2SGenerationModel")
 
         self.cfg = cfg
         self.data_prepared = False
@@ -89,13 +87,17 @@ class DialogueS2SGenerationModel(NLPModel):
         return {'loss': loss}
 
     def validation_step(self, batch, batch_idx):
-        return self.eval_step_helper(batch=batch)
+        loss = self.eval_step_helper(batch=batch)
+        self.validation_step_outputs.append(loss)
+        return loss
 
-    def validation_epoch_end(self, outputs):
-        self.eval_epoch_end(outputs, mode='val')
+    def on_validation_epoch_end(self):
+        self.eval_epoch_end(self.validation_step_outputs, mode='val')
+        self.validation_step_outputs.clear()  # free memory
 
-    def test_epoch_end(self, outputs):
-        self.eval_epoch_end(outputs, mode='test')
+    def on_test_epoch_end(self):
+        self.eval_epoch_end(self.test_step_outputs, mode='test')
+        self.test_step_outputs.clear()  # free memory
 
     def eval_epoch_end(self, outputs, mode='val'):
 
@@ -116,7 +118,10 @@ class DialogueS2SGenerationModel(NLPModel):
         )
 
         DialogueGenerationMetrics.save_predictions(
-            filename, generated_field, ground_truth_field, inputs,
+            filename,
+            generated_field,
+            ground_truth_field,
+            inputs,
         )
 
         label_acc = np.mean([int(generated_field[i] == ground_truth_field[i]) for i in range(len(generated_field))])
@@ -142,7 +147,9 @@ class DialogueS2SGenerationModel(NLPModel):
                 torch.save(self.language_model.state_dict(), filename)
 
     def test_step(self, batch, batch_idx):
-        return self.eval_step_helper(batch=batch, mode='test')
+        loss = self.eval_step_helper(batch=batch, mode='test')
+        self.test_step_outputs.append(loss)
+        return loss
 
     # for inference only
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
@@ -166,7 +173,7 @@ class DialogueS2SGenerationModel(NLPModel):
 
     def prepare_megatron_generation(self, labels, input_ids, template_length):
         """
-        # adapted from MegatronGPTModel._bucketize_gpt_inference 
+        # adapted from MegatronGPTModel._bucketize_gpt_inference
         """
         batch_size = labels.size(0)
         prompt_tags = [self.prompt_tags[0]] * batch_size if self.prompt_tags else None

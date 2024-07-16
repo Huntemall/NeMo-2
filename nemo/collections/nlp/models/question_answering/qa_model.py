@@ -32,6 +32,7 @@ from nemo.collections.nlp.modules.common import TokenClassifier
 from nemo.collections.nlp.parts.utils_funcs import tensor2list
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.utils import logging
+from nemo.utils.decorators import deprecated_warning
 
 __all__ = ['QAModel']
 
@@ -42,6 +43,9 @@ class QAModel(NLPModel):
     """
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        # deprecation warning
+        deprecated_warning("QAModel")
+
         super().__init__(cfg=cfg, trainer=trainer)
         self.classifier = TokenClassifier(
             hidden_size=self.hidden_size,
@@ -94,16 +98,20 @@ class QAModel(NLPModel):
             'start_logits': start_logits,
             'end_logits': end_logits,
         }
-        return {f'{prefix}_loss': loss, f'{prefix}_tensors': tensors}
+        loss = {f'{prefix}_loss': loss, f'{prefix}_tensors': tensors}
+        self.validation_step_outputs.append(loss) if prefix == 'val' else self.test_step_outputs.append(loss)
+        return loss
 
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
         if self.trainer.testing:
             prefix = 'test'
+            outputs = self.test_step_outputs
         else:
             prefix = 'val'
+            outputs = self.validation_step_outputs
 
         avg_loss = torch.stack([x[f'{prefix}_loss'] for x in outputs]).mean()
 
@@ -159,9 +167,10 @@ class QAModel(NLPModel):
         self.log(f'{prefix}_loss', avg_loss)
         self.log(f'{prefix}_exact_match', exact_match)
         self.log(f'{prefix}_f1', f1)
+        self.validation_step_outputs.clear() if prefix == 'val' else self.test_step_outputs.clear()  # free memory
 
-    def test_epoch_end(self, outputs):
-        return self.validation_epoch_end(outputs)
+    def on_test_epoch_end(self):
+        return self.on_validation_epoch_end()
 
     @torch.no_grad()
     def inference(
@@ -181,7 +190,7 @@ class QAModel(NLPModel):
             num_samples: number of samples to use of inference data. Default: -1 if all data should be used.
             output_nbest_file: optional output file for writing out nbest list
             output_prediction_file: optional output file for writing out predictions
-            
+
         Returns:
             model predictions, model nbest list
         """

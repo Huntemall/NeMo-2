@@ -34,14 +34,18 @@ from nemo.collections.nlp.metrics.dialogue_metrics import DialogueGenerationMetr
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
+from nemo.utils.decorators import deprecated_warning
 
 __all__ = ['DialogueNearestNeighbourModel']
 
 
 class DialogueNearestNeighbourModel(NLPModel):
-    """Dialogue Nearest Neighbour Model identifies the intent of an utterance using the cosine similarity between sentence embeddings of the utterance and various label descriptions """
+    """Dialogue Nearest Neighbour Model identifies the intent of an utterance using the cosine similarity between sentence embeddings of the utterance and various label descriptions"""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        # deprecation warning
+        deprecated_warning("DialogueNearestNeighbourModel")
+
         self.cfg = cfg
         super().__init__(cfg=cfg, trainer=trainer)
         if self.cfg.library == "huggingface":
@@ -92,7 +96,9 @@ class DialogueNearestNeighbourModel(NLPModel):
         raise NotImplementedError
 
     def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx, mode='test')
+        loss = self.validation_step(batch, batch_idx, mode='test')
+        self.test_step_outputs.append(loss)
+        return loss
 
     @staticmethod
     def mean_pooling(model_output, attention_mask):
@@ -121,15 +127,22 @@ class DialogueNearestNeighbourModel(NLPModel):
             gts.append(input_ids[i, gt])
             inputs.append(input_ids[i, 0])
 
-        return {'preds': torch.stack(preds), 'labels': torch.stack(gts), 'inputs': torch.stack(inputs)}
+        loss = {'preds': torch.stack(preds), 'labels': torch.stack(gts), 'inputs': torch.stack(inputs)}
+        self.validation_step_outputs.append(loss)
+        return loss
 
     def multi_test_epoch_end(self, outputs, dataloader_idx):
-        return self.validation_epoch_end(outputs)
+        return self.on_validation_epoch_end()
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
         """
         Get metrics based on the candidate label with the highest predicted likelihood and the ground truth label for intent
         """
+        prefix = "test" if self.trainer.testing else "val"
+        if prefix == "val":
+            outputs = self.validation_step_outputs
+        else:
+            outputs = self.test_step_outputs
         output_preds = torch.cat([output['preds'] for output in outputs], dim=0)
         output_labels = torch.cat([output['labels'] for output in outputs], dim=0)
         inputs = torch.cat([output['inputs'] for output in outputs], dim=0)
@@ -146,7 +159,10 @@ class DialogueNearestNeighbourModel(NLPModel):
         filename = os.path.join(self.cfg.dataset.dialogues_example_dir, "test_predictions.jsonl")
 
         DialogueGenerationMetrics.save_predictions(
-            filename, predicted_labels, ground_truth_labels, decoded_inputs,
+            filename,
+            predicted_labels,
+            ground_truth_labels,
+            decoded_inputs,
         )
 
         label_to_ids = {label: idx for idx, label in enumerate(list(set(predicted_labels + ground_truth_labels)))}
@@ -174,6 +190,7 @@ class DialogueNearestNeighbourModel(NLPModel):
         self.log('unfied_accuracy', label_acc * 100)
 
         self.classification_report.reset()
+        self.validation_step_outputs.clear() if prefix == 'val' else self.test_step_outputs.clear()
 
     def setup_training_data(self, train_data_config: Optional[DictConfig]):
         if not train_data_config:

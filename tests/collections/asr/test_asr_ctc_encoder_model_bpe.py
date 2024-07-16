@@ -22,9 +22,9 @@ import torch
 from omegaconf import DictConfig
 
 from nemo.collections.asr.data import audio_to_text
-from nemo.collections.asr.metrics.wer_bpe import CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.asr.models import configs
 from nemo.collections.asr.models.ctc_bpe_models import EncDecCTCModelBPE
+from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.common import tokenizers
 from nemo.utils.config_utils import assert_dataclass_signature_match
 
@@ -269,7 +269,7 @@ class TestEncDecCTCModel:
     def test_decoding_change(self, asr_model):
         assert asr_model.decoding is not None
         assert isinstance(asr_model.decoding, CTCBPEDecoding)
-        assert asr_model.decoding.cfg.strategy == "greedy"
+        assert asr_model.decoding.cfg.strategy == "greedy_batch"
         assert asr_model.decoding.preserve_alignments is False
         assert asr_model.decoding.compute_timestamps is False
 
@@ -309,7 +309,10 @@ class TestEncDecCTCModel:
         REMAP_ARGS = {'trim_silence': 'trim', 'labels': 'tokenizer'}
 
         result = assert_dataclass_signature_match(
-            audio_to_text.AudioToBPEDataset, configs.ASRDatasetConfig, ignore_args=IGNORE_ARGS, remap_args=REMAP_ARGS,
+            audio_to_text.AudioToBPEDataset,
+            configs.ASRDatasetConfig,
+            ignore_args=IGNORE_ARGS,
+            remap_args=REMAP_ARGS,
         )
         signatures_match, cls_subset, dataclass_subset = result
 

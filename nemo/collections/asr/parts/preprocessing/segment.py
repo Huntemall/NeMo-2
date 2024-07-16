@@ -36,13 +36,13 @@
 import math
 import os
 import random
-from typing import Optional
+from typing import Iterable, Optional, Union
 
 import librosa
 import numpy as np
+import numpy.typing as npt
 import soundfile as sf
 
-from nemo.collections.asr.parts.utils.audio_utils import select_channels
 from nemo.utils import logging
 
 # TODO @blisc: Perhaps refactor instead of import guarding
@@ -50,12 +50,102 @@ HAVE_PYDUB = True
 try:
     from pydub import AudioSegment as Audio
     from pydub.exceptions import CouldntDecodeError
+
+    # FFMPEG for some formats needs explicitly defined coding-decoding strategy
+    ffmpeg_codecs = {'opus': 'opus'}
+
 except ModuleNotFoundError:
     HAVE_PYDUB = False
 
 
 available_formats = sf.available_formats()
 sf_supported_formats = ["." + i.lower() for i in available_formats.keys()]
+
+
+ChannelSelectorType = Union[int, Iterable[int], str]
+
+
+def select_channels(signal: npt.NDArray, channel_selector: Optional[ChannelSelectorType] = None) -> npt.NDArray:
+    """
+    Convert a multi-channel signal to a single-channel signal by averaging over channels or selecting a single channel,
+    or pass-through multi-channel signal when channel_selector is `None`.
+
+    Args:
+        signal: numpy array with shape (..., num_channels)
+        channel selector: string denoting the downmix mode, an integer denoting the channel to be selected, or an iterable
+                          of integers denoting a subset of channels. Channel selector is using zero-based indexing.
+                          If set to `None`, the original signal will be returned. Uses zero-based indexing.
+
+    Returns:
+        numpy array
+    """
+    if signal.ndim == 1:
+        # For one-dimensional input, return the input signal.
+        if channel_selector not in [None, 0, 'average']:
+            raise ValueError(
+                'Input signal is one-dimensional, channel selector (%s) cannot not be used.', str(channel_selector)
+            )
+        return signal
+
+    num_channels = signal.shape[-1]
+    num_samples = signal.size // num_channels  # handle multi-dimensional signals
+
+    if num_channels >= num_samples:
+        logging.warning(
+            'Number of channels (%d) is greater or equal than number of samples (%d). Check for possible transposition.',
+            num_channels,
+            num_samples,
+        )
+
+    # Samples are arranged as (num_channels, ...)
+    if channel_selector is None:
+        # keep the original multi-channel signal
+        pass
+    elif channel_selector == 'average':
+        # default behavior: downmix by averaging across channels
+        signal = np.mean(signal, axis=-1)
+    elif isinstance(channel_selector, int):
+        # select a single channel
+        if channel_selector >= num_channels:
+            raise ValueError(f'Cannot select channel {channel_selector} from a signal with {num_channels} channels.')
+        signal = signal[..., channel_selector]
+    elif isinstance(channel_selector, Iterable):
+        # select multiple channels
+        if max(channel_selector) >= num_channels:
+            raise ValueError(
+                f'Cannot select channel subset {channel_selector} from a signal with {num_channels} channels.'
+            )
+        signal = signal[..., channel_selector]
+        # squeeze the channel dimension if a single-channel is selected
+        # this is done to have the same shape as when using integer indexing
+        if len(channel_selector) == 1:
+            signal = np.squeeze(signal, axis=-1)
+    else:
+        raise ValueError(f'Unexpected value for channel_selector ({channel_selector})')
+
+    return signal
+
+
+def get_samples(audio_file: str, target_sr: int = 16000, dtype: str = 'float32'):
+    """
+    Read the samples from the given audio_file path. If not specified, the input audio file is automatically
+    resampled to 16kHz.
+
+    Args:
+        audio_file (str):
+            Path to the input audio file
+        target_sr (int):
+            Targeted sampling rate
+    Returns:
+        samples (numpy.ndarray):
+            Time-series sample data from the given audio file
+    """
+    with sf.SoundFile(audio_file, 'r') as f:
+        samples = f.read(dtype=dtype)
+        if f.samplerate != target_sr:
+            samples = librosa.core.resample(samples, orig_sr=f.samplerate, target_sr=target_sr)
+        samples = samples.transpose()
+    return samples
 
 
 class AudioSegment(object):
@@ -239,9 +329,9 @@ class AudioSegment(object):
                 with sf.SoundFile(audio_file, 'r') as f:
                     dtype = 'int32' if int_values else 'float32'
                     sample_rate = f.samplerate
-                    if offset > 0:
+                    if offset is not None and offset > 0:
                         f.seek(int(offset * sample_rate))
-                    if duration > 0:
+                    if duration is not None and duration > 0:
                         samples = f.read(int(duration * sample_rate), dtype=dtype)
                     else:
                         samples = f.read(dtype=dtype)
@@ -256,14 +346,14 @@ class AudioSegment(object):
 
         if HAVE_PYDUB and samples is None:
             try:
-                samples = Audio.from_file(audio_file)
+                samples = Audio.from_file(audio_file, codec=ffmpeg_codecs.get(os.path.splitext(audio_file)[-1]))
                 sample_rate = samples.frame_rate
                 num_channels = samples.channels
                 if offset > 0:
                     # pydub does things in milliseconds
                     seconds = offset * 1000
                     samples = samples[int(seconds) :]
-                if duration > 0:
+                if duration is not None and duration > 0:
                     seconds = duration * 1000
                     samples = samples[: int(seconds)]
                 samples = np.array(samples.get_array_of_samples())
@@ -370,12 +460,26 @@ class AudioSegment(object):
         sample_rate = target_sr
 
         return cls(
-            samples, sample_rate, target_sr=target_sr, trim=trim, channel_selector=channel_selector, *args, **kwargs,
+            samples,
+            sample_rate,
+            target_sr=target_sr,
+            trim=trim,
+            channel_selector=channel_selector,
+            *args,
+            **kwargs,
         )
 
     @classmethod
     def segment_from_file(
-        cls, audio_file, target_sr=None, n_segments=0, trim=False, orig_sr=None, channel_selector=None, offset=None
+        cls,
+        audio_file,
+        target_sr=None,
+        n_segments=0,
+        trim=False,
+        orig_sr=None,
+        channel_selector=None,
+        offset=None,
+        dtype='float32',
     ):
         """Grabs n_segments number of samples from audio_file.
         If offset is not provided, n_segments are selected randomly.
@@ -390,6 +494,7 @@ class AudioSegment(object):
         :param orig_sr: the original sample rate
         :param channel selector: select a subset of channels. If set to `None`, the original signal will be used.
         :param offset: fixed offset in seconds
+        :param dtype: data type to load audio as.
         :return: numpy array of samples
         """
         is_segmented = False
@@ -412,15 +517,15 @@ class AudioSegment(object):
                                 f'Provided audio start ({audio_start}) is larger than the maximum possible ({max_audio_start})'
                             )
                     f.seek(audio_start)
-                    samples = f.read(n_segments_at_original_sr, dtype='float32')
+                    samples = f.read(n_segments_at_original_sr, dtype=dtype)
                     is_segmented = True
                 elif n_segments_at_original_sr > len(f):
                     logging.warning(
                         f"Number of segments ({n_segments_at_original_sr}) is greater than the length ({len(f)}) of the audio file {audio_file}. This may lead to shape mismatch errors."
                     )
-                    samples = f.read(dtype='float32')
+                    samples = f.read(dtype=dtype)
                 else:
-                    samples = f.read(dtype='float32')
+                    samples = f.read(dtype=dtype)
         except RuntimeError as e:
             logging.error(f"Loading {audio_file} via SoundFile raised RuntimeError: `{e}`.")
             raise e
@@ -459,9 +564,8 @@ class AudioSegment(object):
 
     @property
     def rms_db(self):
-        """Return per-channel RMS value.
-        """
-        mean_square = np.mean(self._samples ** 2, axis=0)
+        """Return per-channel RMS value."""
+        mean_square = np.mean(self._samples**2, axis=0)
         return 10 * np.log10(mean_square)
 
     @property
@@ -472,7 +576,7 @@ class AudioSegment(object):
         self._samples *= 10.0 ** (gain / 20.0)
 
     def normalize_db(self, target_db=-20, ref_channel=None):
-        """Normalize the signal to a target RMS value in decibels. 
+        """Normalize the signal to a target RMS value in decibels.
         For multi-channel audio, the RMS value is determined by the reference channel (if not None),
         otherwise it will be the maximum RMS across all channels.
         """
@@ -500,7 +604,11 @@ class AudioSegment(object):
                 f"Padding not implemented for signals with more that 2 dimensions. Current samples dimension: {samples_ndim}."
             )
         # apply padding
-        self._samples = np.pad(self._samples, pad_width, mode='constant',)
+        self._samples = np.pad(
+            self._samples,
+            pad_width,
+            mode='constant',
+        )
 
     def subsegment(self, start_time=None, end_time=None):
         """Cut the AudioSegment between given boundaries.

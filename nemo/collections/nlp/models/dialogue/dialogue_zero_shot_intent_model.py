@@ -36,6 +36,7 @@ from nemo.collections.nlp.metrics.dialogue_metrics import DialogueGenerationMetr
 from nemo.collections.nlp.models import TextClassificationModel
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
+from nemo.utils.decorators import deprecated_warning
 
 __all__ = ['DialogueZeroShotIntentModel']
 
@@ -44,6 +45,9 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
     """TextClassificationModel to be trained on two- or three-class textual entailment data, to be used for zero shot intent recognition."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        # deprecation warning
+        deprecated_warning("DialogueZeroShotIntentModel")
+
         self.cfg = cfg
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -192,7 +196,7 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
             collate_fn=dataset.collate_fn,
         )
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, split='val'):
         """
         Lightning calls this inside the validation loop with the data from the validation dataloader
         passed in as `batch`.
@@ -206,7 +210,7 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
 
         tp, fn, fp, _ = self.classification_report(preds, labels)
 
-        return {
+        loss = {
             'val_loss': val_loss,
             'tp': tp,
             'fn': fn,
@@ -215,14 +219,16 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
             'input_ids': input_ids,
             'labels': labels,
         }
+        self.validation_step_outputs.append(loss)
+        return loss
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self, split="val"):
         """
         Get metrics based on the candidate label with the highest predicted likelihood and the ground truth label for intent
         """
-        output_logits = torch.cat([output['logits'] for output in outputs], dim=0)
-        output_input_ids = torch.cat([output['input_ids'] for output in outputs], dim=0)
-        output_labels = torch.cat([output['labels'] for output in outputs], dim=0)
+        output_logits = torch.cat([output['logits'] for output in self.validation_step_outputs], dim=0)
+        output_input_ids = torch.cat([output['input_ids'] for output in self.validation_step_outputs], dim=0)
+        output_labels = torch.cat([output['labels'] for output in self.validation_step_outputs], dim=0)
 
         if self.cfg.library == 'huggingface':
             entail_logits = output_logits[..., 2]
@@ -273,7 +279,10 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
         filename = os.path.join(self.cfg.dataset.dialogues_example_dir, "test_predictions.jsonl")
 
         DialogueGenerationMetrics.save_predictions(
-            filename, predicted_labels, ground_truth_labels, utterances,
+            filename,
+            predicted_labels,
+            ground_truth_labels,
+            utterances,
         )
 
         label_to_ids = {label: idx for idx, label in enumerate(list(set(predicted_labels + ground_truth_labels)))}
@@ -291,7 +300,7 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
         precision, recall, f1, report = self.classification_report.compute()
         label_acc = np.mean([int(predicted_labels[i] == ground_truth_labels[i]) for i in range(len(predicted_labels))])
 
-        avg_loss = torch.stack([x[f'val_loss'] for x in outputs]).mean()
+        avg_loss = torch.stack([x[f'val_loss'] for x in self.validation_step_outputs]).mean()
 
         logging.info(report)
 
@@ -301,6 +310,7 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
         self.log('unfied_accuracy', label_acc * 100)
         self.log('val_loss', avg_loss, prog_bar=True)
 
+        self.validation_step_outputs.clear()  # free memory
         self.classification_report.reset()
 
     def predict(
@@ -313,7 +323,6 @@ class DialogueZeroShotIntentModel(TextClassificationModel):
         entailment_idx=1,
         contradiction_idx=0,
     ) -> List[Dict]:
-
         """
         Given a list of queries and a list of candidate labels, return a ranked list of labels and scores for each query.
 

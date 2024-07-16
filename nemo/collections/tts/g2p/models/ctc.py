@@ -26,13 +26,16 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 from nemo.collections.tts.g2p.data.ctc import CTCG2PBPEDataset
 from nemo.collections.tts.models.base import G2PModel
 from nemo.core.classes.common import PretrainedModelInfo
+from nemo.core.classes.exportable import Exportable
+from nemo.core.neural_types import LengthsType, NeuralType, TokenIndex
 from nemo.utils import logging
 
 try:
     from nemo.collections.asr.losses.ctc import CTCLoss
-    from nemo.collections.asr.metrics.wer_bpe import WERBPE, CTCBPEDecoding, CTCBPEDecodingConfig
+    from nemo.collections.asr.metrics.wer import WER
     from nemo.collections.asr.models import EncDecCTCModel
     from nemo.collections.asr.parts.mixins import ASRBPEMixin
+    from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
 
     ASR_AVAILABLE = True
 except (ModuleNotFoundError, ImportError) as e:
@@ -48,7 +51,7 @@ class CTCG2PConfig:
     validation_ds: Optional[Dict[Any, Any]] = None
 
 
-class CTCG2PModel(G2PModel, ASRBPEMixin):
+class CTCG2PModel(G2PModel, ASRBPEMixin, Exportable):
     """
     CTC-based grapheme-to-phoneme model.
     """
@@ -98,8 +101,8 @@ class CTCG2PModel(G2PModel, ASRBPEMixin):
 
         self.decoding = CTCBPEDecoding(self.cfg.decoding, tokenizer=self.tokenizer)
 
-        self._wer = WERBPE(decoding=self.decoding, use_cer=False, log_prediction=False, dist_sync_on_step=True,)
-        self._per = WERBPE(decoding=self.decoding, use_cer=True, log_prediction=False, dist_sync_on_step=True,)
+        self.wer = WER(decoding=self.decoding, use_cer=False, log_prediction=False, dist_sync_on_step=True,)
+        self.per = WER(decoding=self.decoding, use_cer=True, log_prediction=False, dist_sync_on_step=True,)
 
     def setup_grapheme_tokenizer(self, cfg):
         """ Initialized grapheme tokenizer """
@@ -195,8 +198,8 @@ class CTCG2PModel(G2PModel, ASRBPEMixin):
         self.log("train_loss", loss)
         return loss
 
-    def training_epoch_end(self, outputs):
-        return super().training_epoch_end(outputs)
+    def on_train_epoch_end(self):
+        return super().on_train_epoch_end()
 
     # ===== Validation Functions ===== #
     def validation_step(self, batch, batch_idx, dataloader_idx=0, split="val"):
@@ -209,20 +212,20 @@ class CTCG2PModel(G2PModel, ASRBPEMixin):
             log_probs=log_probs, targets=targets, input_lengths=encoded_len, target_lengths=target_lengths
         )
 
-        self._wer.update(
-            predictions=log_probs, targets=targets, target_lengths=target_lengths, predictions_lengths=encoded_len
+        self.wer.update(
+            predictions=log_probs, targets=targets, targets_lengths=target_lengths, predictions_lengths=encoded_len
         )
-        wer, wer_num, wer_denom = self._wer.compute()
-        self._wer.reset()
+        wer, wer_num, wer_denom = self.wer.compute()
+        self.wer.reset()
 
-        self._per.update(
-            predictions=log_probs, targets=targets, target_lengths=target_lengths, predictions_lengths=encoded_len
+        self.per.update(
+            predictions=log_probs, targets=targets, targets_lengths=target_lengths, predictions_lengths=encoded_len
         )
-        per, per_num, per_denom = self._per.compute()
-        self._per.reset()
+        per, per_num, per_denom = self.per.compute()
+        self.per.reset()
 
         self.log(f"{split}_loss", val_loss)
-        return {
+        loss = {
             f"{split}_loss": val_loss,
             f"{split}_wer_num": wer_num,
             f"{split}_wer_denom": wer_denom,
@@ -231,6 +234,19 @@ class CTCG2PModel(G2PModel, ASRBPEMixin):
             f"{split}_per_denom": per_denom,
             f"{split}_per": per,
         }
+
+        if split == 'val':
+            if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
+                self.validation_step_outputs[dataloader_idx].append(loss)
+            else:
+                self.validation_step_outputs.append(loss)
+        elif split == 'test':
+            if type(self.trainer.test_dataloaders) == list and len(self.trainer.test_dataloaders) > 1:
+                self.test_step_outputs[dataloader_idx].append(loss)
+            else:
+                self.test_step_outputs.append(loss)
+
+        return loss
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         """
@@ -407,3 +423,74 @@ class CTCG2PModel(G2PModel, ASRBPEMixin):
     @classmethod
     def list_available_models(cls) -> 'List[PretrainedModelInfo]':
         return []
+
+    @property
+    def wer(self):
+        return self._wer
+
+    @wer.setter
+    def wer(self, wer):
+        self._wer = wer
+
+    @property
+    def per(self):
+        return self._per
+
+    @per.setter
+    def per(self, per):
+        self._per = per
+
+    # Methods for model exportability
+    def _prepare_for_export(self, **kwargs):
+        super()._prepare_for_export(**kwargs)
+
+        # Define input_types and output_types as required by export()
+        self._input_types = {
+            "input_ids": NeuralType(('B', 'T'), TokenIndex()),
+            "input_len": NeuralType(tuple('B'), LengthsType()),
+        }
+        self._output_types = {
+            # "preds_str": NeuralType(('B', 'T'), LabelsType()),
+            "log_probs": NeuralType(('B', 'T'), LossType()),
+            "encoded_len": NeuralType(('B', 'T'), LengthsType()),
+        }
+
+    def _export_teardown(self):
+        self._input_types = self._output_types = None
+
+    @property
+    def input_types(self):
+        return self._input_types
+
+    @property
+    def output_types(self):
+        return self._output_types
+
+    def input_example(self, max_batch=1, max_dim=44):
+        """
+        Generates input examples for tracing etc.
+        Returns:
+            A tuple of input examples.
+        """
+        # par = next(self.fastpitch.parameters())
+        sentence = "Kupil sem si bicikel in mu zamenjal stol."
+        input_ids = [self.tokenizer_grapheme.text_to_ids(sentence)]
+        input_len = [len(entry) for entry in input_ids]
+        max_len = max(input_len)
+        input_ids = [entry + [0] * (max_len - entry_len) for entry, entry_len in zip(input_ids, input_len)]
+        inputs = (torch.tensor(input_ids).to(self.device), torch.tensor(input_len).to(self.device))
+        return inputs
+
+    def forward_for_export(self, input_ids, input_len):
+        input_embedding = self.embedding(input_ids)
+        input_embedding = input_embedding.transpose(1, 2)
+        encoded_input, encoded_len = self.encoder(audio_signal=input_embedding, length=input_len)
+
+        log_probs = self.decoder(encoder_output=encoded_input)
+        return (log_probs, encoded_len)
+        # preds_str, _ = self.decoding.ctc_decoder_predictions_tensor(
+        #    log_probs, decoder_lengths=encoded_len, return_hypotheses=True
+        # )
+        # results = [h.y_sequence for h in preds_str]
+
+        # return tuple(results)

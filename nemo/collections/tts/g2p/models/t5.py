@@ -25,6 +25,7 @@ from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.tts.g2p.data.t5 import T5G2PDataset
 from nemo.collections.tts.models.base import G2PModel
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
+from nemo.core.classes.exportable import Exportable
 from nemo.core.neural_types import LabelsType, LossType, MaskType, NeuralType, TokenIndex
 from nemo.utils import logging
 
@@ -38,24 +39,30 @@ class T5G2PConfig:
     test_ds: Optional[Dict[Any, Any]] = None
 
 
-class T5G2PModel(G2PModel):
+class T5G2PModel(G2PModel, Exportable):
     """
     T5-based grapheme-to-phoneme model.
     """
 
     @property
     def input_types(self) -> Optional[Dict[str, NeuralType]]:
-        return {
-            "input_ids": NeuralType(('B', 'T'), TokenIndex()),
-            "attention_mask": NeuralType(('B', 'T'), MaskType(), optional=True),
-            "labels": NeuralType(('B', 'T'), LabelsType()),
-        }
+        if self._input_types is None:
+            return {
+                "input_ids": NeuralType(('B', 'T'), TokenIndex()),
+                "attention_mask": NeuralType(('B', 'T'), MaskType(), optional=True),
+                "labels": NeuralType(('B', 'T'), LabelsType()),
+            }
+        return self._input_types
 
     @property
     def output_types(self) -> Optional[Dict[str, NeuralType]]:
-        return {"loss": NeuralType((), LossType())}
+        if self._output_types is None:
+            return {"loss": NeuralType((), LossType())}
+        return self._output_types
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        self._input_types = None
+        self._output_types = None
         self.world_size = 1
         if trainer is not None:
             self.world_size = trainer.num_nodes * trainer.num_devices
@@ -90,13 +97,17 @@ class T5G2PModel(G2PModel):
     # ===== Training Functions ===== #
     def training_step(self, batch, batch_idx):
         input_ids, attention_mask, labels = batch
-        train_loss = self.forward(input_ids=input_ids, attention_mask=attention_mask, labels=labels,)
+        train_loss = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
 
         self.log('train_loss', train_loss)
         return train_loss
 
-    def training_epoch_end(self, outputs):
-        return super().training_epoch_end(outputs)
+    def on_train_epoch_end(self):
+        return super().on_train_epoch_end()
 
     def _setup_infer_dataloader(self, cfg) -> 'torch.utils.data.DataLoader':
         """
@@ -125,7 +136,10 @@ class T5G2PModel(G2PModel):
 
     # Functions for inference
     @torch.no_grad()
-    def _infer(self, config: DictConfig,) -> List[int]:
+    def _infer(
+        self,
+        config: DictConfig,
+    ) -> List[int]:
         """
         Runs model inference.
 
@@ -160,7 +174,11 @@ class T5G2PModel(G2PModel):
         input_ids, attention_mask, labels = batch
 
         # Get loss from forward step
-        val_loss = self.forward(input_ids=input_ids, attention_mask=attention_mask, labels=labels,)
+        val_loss = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
 
         # Get preds from generate function and calculate PER
         labels_str = self._tokenizer.batch_decode(
@@ -170,7 +188,18 @@ class T5G2PModel(G2PModel):
         )
         generated_str, _, _ = self._generate_predictions(input_ids=input_ids, model_max_target_len=self.max_target_len)
         per = word_error_rate(hypotheses=generated_str, references=labels_str, use_cer=True)
-        return {f"{split}_loss": val_loss, 'per': per}
+        output = {f"{split}_loss": val_loss, 'per': per}
+        if split == 'val':
+            if isinstance(self.trainer.val_dataloaders, (list, tuple)) and len(self.trainer.val_dataloaders) > 1:
+                self.validation_step_outputs[dataloader_idx].append(output)
+            else:
+                self.validation_step_outputs.append(output)
+        else:
+            if isinstance(self.trainer.test_dataloaders, (list, tuple)) and len(self.trainer.test_dataloaders) > 1:
+                self.test_step_outputs[dataloader_idx].append(output)
+            else:
+                self.test_step_outputs.append(output)
+        return output
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         """
@@ -260,3 +289,45 @@ class T5G2PModel(G2PModel):
     @classmethod
     def list_available_models(cls) -> 'List[PretrainedModelInfo]':
         return []
+
+    def _prepare_for_export(self, **kwargs):
+        super()._prepare_for_export(**kwargs)
+
+        tensor_shape = ('B', 'T')
+
+        # Define input_types and output_types as required by export()
+        self._input_types = {
+            "input_ids": NeuralType(tensor_shape, TokenIndex()),
+        }
+        self._output_types = {
+            "preds_str": NeuralType(tensor_shape, LabelsType()),
+        }
+
+    def _export_teardown(self):
+        self._input_types = None
+        self._output_types = None
+
+    def input_example(self, max_batch=1, max_dim=44):
+        """
+        Generates input examples for tracing etc.
+        Returns:
+            A tuple of input examples.
+        """
+        # par = next(self.fastpitch.parameters())
+        sentence = "Kupil sem si bicikel in mu zamenjal stol."
+        input_ids = [sentence]
+        input_encoding = self._tokenizer(
+            input_ids,
+            padding='longest',
+            max_length=self.max_source_len,
+            truncation=True,
+            return_tensors='pt',
+        )
+        return (input_encoding.input_ids,)
+
+    def forward_for_export(self, input_ids):
+        outputs = self.model.generate(
+            input_ids, output_scores=True, return_dict_in_generate=True, max_length=self.max_source_len
+        )
+        generated_ids, sequence_toks_scores = outputs['sequences'], outputs['scores']
+        return tuple(generated_ids)

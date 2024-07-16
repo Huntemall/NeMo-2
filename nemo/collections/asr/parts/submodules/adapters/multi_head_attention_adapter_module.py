@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -29,7 +29,7 @@ class MHAResidualAddAdapterStrategy(adapter_mixin_strategies.ResidualAddAdapterS
     An implementation of residual addition of an adapter module with its input for the MHA Adapters.
     """
 
-    def forward(self, input: torch.Tensor, adapter: torch.nn.Module, *, module: 'AdapterModuleMixin'):
+    def forward(self, input: dict, adapter: torch.nn.Module, *, module: 'AdapterModuleMixin'):
         """
         A basic strategy, comprising of a residual connection over the input, after forward pass by
         the underlying adapter. Additional work is done to pack and unpack the dictionary of inputs and outputs.
@@ -38,10 +38,14 @@ class MHAResidualAddAdapterStrategy(adapter_mixin_strategies.ResidualAddAdapterS
 
         Args:
             input: A dictionary of multiple input arguments for the adapter module.
+
                 `query`, `key`, `value`: Original output tensor of the module, or the output of the
                  previous adapter (if more than one adapters are enabled).
+
                  `mask`: Attention mask.
+
                  `pos_emb`: Optional positional embedding for relative encoding.
+
             adapter: The adapter module that is currently required to perform the forward pass.
             module: The calling module, in its entirety. It is a module that implements `AdapterModuleMixin`,
                 therefore the strategy can access all other adapters in this module via `module.adapter_layer`.
@@ -51,18 +55,29 @@ class MHAResidualAddAdapterStrategy(adapter_mixin_strategies.ResidualAddAdapterS
         """
         out = self.compute_output(input, adapter, module=module)
 
+        value_name = None
+        if 'value' in input:
+            value_name = 'value'
+        elif 'values' in input:
+            value_name = 'values'
+        else:
+            raise ValueError(
+                "Input dictionary must contain 'value' or 'values' key for residual connection. Input "
+                f"dictionary keys: {input.keys()}"
+            )
+
         # If not in training mode, or probability of stochastic depth is 0, skip step.
         p = self.stochastic_depth
         if not module.training or p == 0.0:
             pass
         else:
-            out = self.apply_stochastic_depth(out, input['value'], adapter, module=module)
+            out = self.apply_stochastic_depth(out, input[value_name], adapter, module=module)
 
         # Return the residual connection output = input + adapter(input)
-        result = input['value'] + out
+        result = input[value_name] + out
 
         # If l2_lambda is activated, register the loss value
-        self.compute_auxiliary_losses(result, input['value'], adapter, module=module)
+        self.compute_auxiliary_losses(result, input[value_name], adapter, module=module)
 
         return result
 
@@ -100,16 +115,17 @@ class MHAResidualAddAdapterStrategyConfig(adapter_mixin_strategies.ResidualAddAd
 
 class MultiHeadAttentionAdapter(mha.MultiHeadAttention, adapter_modules.AdapterModuleUtil):
     """Multi-Head Attention layer of Transformer.
-     Args:
-         n_head (int): number of heads
-         n_feat (int): size of the features
-         dropout_rate (float): dropout rate
-         proj_dim (int, optional): Optional integer value for projection before computing attention.
-            If None, then there is no projection (equivalent to proj_dim = n_feat).
-            If > 0, then will project the n_feat to proj_dim before calculating attention.
-            If <0, then will equal n_head, so that each head has a projected dimension of 1.
-        adapter_strategy: By default, MHAResidualAddAdapterStrategyConfig. An adapter composition function object.
-     """
+
+    Args:
+        n_head (int): number of heads
+        n_feat (int): size of the features
+        dropout_rate (float): dropout rate
+        proj_dim (int, optional): Optional integer value for projection before computing attention.
+           If None, then there is no projection (equivalent to proj_dim = n_feat).
+           If > 0, then will project the n_feat to proj_dim before calculating attention.
+           If <0, then will equal n_head, so that each head has a projected dimension of 1.
+       adapter_strategy: By default, MHAResidualAddAdapterStrategyConfig. An adapter composition function object.
+    """
 
     def __init__(
         self,
@@ -147,18 +163,18 @@ class MultiHeadAttentionAdapter(mha.MultiHeadAttention, adapter_modules.AdapterM
         # reset parameters for Q to be identity operation
         self.reset_parameters()
 
-    def forward(self, query, key, value, mask, pos_emb=None, cache=None, cache_next=None):
+    def forward(self, query, key, value, mask, pos_emb=None, cache=None):
         """Compute 'Scaled Dot Product Attention'.
         Args:
             query (torch.Tensor): (batch, time1, size)
             key (torch.Tensor): (batch, time2, size)
             value(torch.Tensor): (batch, time2, size)
             mask (torch.Tensor): (batch, time1, time2)
-            cache (torch.Tensor) : (cache_nums, batch, time_cache, size)
-            cache_next (torch.Tensor) : (cache_nums, batch, time_cache_next, size)
+            cache (torch.Tensor) : (batch, time_cache, size)
 
         returns:
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
+            cache  (torch.Tensor) : (batch, time_cache_next, size)
         """
         # Need to perform duplicate computations as at this point the tensors have been
         # separated by the adapter forward
@@ -166,7 +182,7 @@ class MultiHeadAttentionAdapter(mha.MultiHeadAttention, adapter_modules.AdapterM
         key = self.pre_norm(key)
         value = self.pre_norm(value)
 
-        return super().forward(query, key, value, mask, pos_emb, cache=cache, cache_next=cache_next)
+        return super().forward(query, key, value, mask, pos_emb, cache=cache)
 
     def reset_parameters(self):
         with torch.no_grad():
@@ -183,13 +199,14 @@ class MultiHeadAttentionAdapterConfig:
     n_feat: int
     dropout_rate: float = 0.0
     proj_dim: Optional[int] = None
-    adapter_strategy: Optional[Any] = MHAResidualAddAdapterStrategyConfig()
+    adapter_strategy: Optional[Any] = field(default_factory=lambda: MHAResidualAddAdapterStrategyConfig())
     _target_: str = "{0}.{1}".format(MultiHeadAttentionAdapter.__module__, MultiHeadAttentionAdapter.__name__)
 
 
 class RelPositionMultiHeadAttentionAdapter(mha.RelPositionMultiHeadAttention, adapter_modules.AdapterModuleUtil):
     """Multi-Head Attention layer of Transformer-XL with support of relative positional encoding.
     Paper: https://arxiv.org/abs/1901.02860
+
     Args:
         n_head (int): number of heads
         n_feat (int): size of the features
@@ -242,7 +259,7 @@ class RelPositionMultiHeadAttentionAdapter(mha.RelPositionMultiHeadAttention, ad
         # reset parameters for Q to be identity operation
         self.reset_parameters()
 
-    def forward(self, query, key, value, mask, pos_emb, cache=None, cache_next=None):
+    def forward(self, query, key, value, mask, pos_emb, cache=None):
         """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
         Args:
             query (torch.Tensor): (batch, time1, size)
@@ -250,10 +267,10 @@ class RelPositionMultiHeadAttentionAdapter(mha.RelPositionMultiHeadAttention, ad
             value(torch.Tensor): (batch, time2, size)
             mask (torch.Tensor): (batch, time1, time2)
             pos_emb (torch.Tensor) : (batch, time1, size)
-            cache (torch.Tensor) : (cache_nums, batch, time_cache, size)
-            cache_next (torch.Tensor) : (cache_nums, batch, time_cache_next, size)
+            cache (torch.Tensor) : (batch, time_cache, size)
         Returns:
             output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
+            cache_next (torch.Tensor) : (batch, time_cache_next, size)
         """
         # Need to perform duplicate computations as at this point the tensors have been
         # separated by the adapter forward
@@ -261,7 +278,7 @@ class RelPositionMultiHeadAttentionAdapter(mha.RelPositionMultiHeadAttention, ad
         key = self.pre_norm(key)
         value = self.pre_norm(value)
 
-        return super().forward(query, key, value, mask, pos_emb, cache=cache, cache_next=cache_next)
+        return super().forward(query, key, value, mask, pos_emb, cache=cache)
 
     def reset_parameters(self):
         with torch.no_grad():
@@ -287,14 +304,13 @@ class RelPositionMultiHeadAttentionAdapterConfig:
     n_feat: int
     dropout_rate: float = 0.0
     proj_dim: Optional[int] = None
-    adapter_strategy: Optional[Any] = MHAResidualAddAdapterStrategyConfig()
+    adapter_strategy: Optional[Any] = field(default_factory=lambda: MHAResidualAddAdapterStrategyConfig())
     _target_: str = "{0}.{1}".format(
         RelPositionMultiHeadAttentionAdapter.__module__, RelPositionMultiHeadAttentionAdapter.__name__
     )
 
 
 class PositionalEncodingAdapter(mha.PositionalEncoding, adapter_modules.AdapterModuleUtil):
-
     """
     Absolute positional embedding adapter.
 
@@ -321,7 +337,11 @@ class PositionalEncodingAdapter(mha.PositionalEncoding, adapter_modules.AdapterM
     ):
 
         super().__init__(
-            d_model=d_model, dropout_rate=0.0, max_len=max_len, xscale=xscale, dropout_rate_emb=0.0,
+            d_model=d_model,
+            dropout_rate=0.0,
+            max_len=max_len,
+            xscale=xscale,
+            dropout_rate_emb=0.0,
         )
 
         # Setup adapter strategy
@@ -336,7 +356,9 @@ class PositionalEncodingAdapterConfig:
     d_model: int
     max_len: int = 5000
     xscale: float = 1.0
-    adapter_strategy: Optional[Any] = adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    adapter_strategy: Optional[Any] = field(
+        default_factory=lambda: adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    )
     _target_: str = "{0}.{1}".format(PositionalEncodingAdapter.__module__, PositionalEncodingAdapter.__name__)
 
 
@@ -378,5 +400,7 @@ class RelPositionalEncodingAdapterConfig:
     d_model: int
     max_len: int = 5000
     xscale: float = 1.0
-    adapter_strategy: Optional[Any] = adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    adapter_strategy: Optional[Any] = field(
+        default_factory=lambda: adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    )
     _target_: str = "{0}.{1}".format(RelPositionalEncodingAdapter.__module__, RelPositionalEncodingAdapter.__name__)

@@ -35,7 +35,7 @@ from nemo.collections.nlp.parts.utils_funcs import tensor2list
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types import LogitsType, NeuralType
 from nemo.utils import logging
-from nemo.utils.decorators import experimental
+from nemo.utils.decorators import deprecated_warning, experimental
 
 __all__ = ["SpellcheckingAsrCustomizationModel"]
 
@@ -48,7 +48,7 @@ class SpellcheckingAsrCustomizationModel(NLPModel):
     It takes as input ASR hypothesis and candidate customization entries.
     It labels the hypothesis with correct entry index or 0.
     Example input:   [CLS] a s t r o n o m e r s _ d i d i e _ s o m o n _ a n d _ t r i s t i a n _ g l l o [SEP] d i d i e r _ s a u m o n [SEP] a s t r o n o m i e [SEP] t r i s t a n _ g u i l l o t [SEP] ...
-    Input segments:      0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0     1 1 1 1 1 1 1 1 1 1 1 1 1 1     2 2 2 2 2 2 2 2 2 2 2     3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3     4      
+    Input segments:      0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0     1 1 1 1 1 1 1 1 1 1 1 1 1 1     2 2 2 2 2 2 2 2 2 2 2     3 3 3 3 3 3 3 3 3 3 3 3 3 3 3 3     4
     Example output:      0 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 3 3 3 3 3 3 3 3 3 3 3 3 3 0     ...
     """
 
@@ -67,6 +67,9 @@ class SpellcheckingAsrCustomizationModel(NLPModel):
         return self
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None) -> None:
+        # deprecation warning
+        deprecated_warning("SpellcheckingAsrCustomizationModel")
+
         super().__init__(cfg=cfg, trainer=trainer)
 
         # Label map contains 11 labels: 0 for nothing, 1..10 for target candidate ids
@@ -191,7 +194,7 @@ class SpellcheckingAsrCustomizationModel(NLPModel):
         return {'loss': loss, 'lr': lr}
 
     # Validation and Testing
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, split="val"):
         """
         Lightning calls this inside the validation loop with the data from the validation dataloader
         passed in as `batch`.
@@ -271,15 +274,25 @@ class SpellcheckingAsrCustomizationModel(NLPModel):
                 torch.tensor(span_predictions).to(self.device), torch.tensor(span_labels).to(self.device)
             )
 
-        val_loss = self.loss_fn(logits=logits, labels=labels, loss_mask=labels_mask)
-        return {'val_loss': val_loss}
+        loss = self.loss_fn(logits=logits, labels=labels, loss_mask=labels_mask)
 
-    def validation_epoch_end(self, outputs):
+        if split == 'val':
+            self.validation_step_outputs.append({f'{split}_loss': loss})
+        elif split == 'test':
+            self.test_step_outputs.append({f'{split}_loss': loss})
+
+        return {f'{split}_loss': loss}
+
+    def on_validation_epoch_end(self):
         """
         Called at the end of validation to aggregate outputs.
         :param outputs: list of individual outputs of each validation step.
         """
-        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
+        split = "test" if self.trainer.testing else "val"
+        if split == 'val':
+            avg_loss = torch.stack([x[f'{split}_loss'] for x in self.validation_step_outputs]).mean()
+        else:
+            avg_loss = torch.stack([x[f'{split}_loss'] for x in self.test_step_outputs]).mean()
 
         # Calculate metrics and classification report
         # Note that in our task recall = accuracy, and the recall column is the per class accuracy
@@ -288,8 +301,8 @@ class SpellcheckingAsrCustomizationModel(NLPModel):
         logging.info("Total tag accuracy: " + str(tag_accuracy))
         logging.info(tag_report)
 
-        self.log('val_loss', avg_loss, prog_bar=True)
-        self.log('tag accuracy', tag_accuracy)
+        self.log(f"{split}_loss", avg_loss, prog_bar=True)
+        self.log(f"{split}_tag_accuracy", tag_accuracy)
 
         self.tag_classification_report.reset()
 
@@ -298,20 +311,20 @@ class SpellcheckingAsrCustomizationModel(NLPModel):
         Lightning calls this inside the test loop with the data from the test dataloader
         passed in as `batch`.
         """
-        return self.validation_step(batch, batch_idx)
+        return self.validation_step(batch, batch_idx, split="test")
 
-    def test_epoch_end(self, outputs):
+    def on_test_epoch_end(self):
         """
         Called at the end of test to aggregate outputs.
         :param outputs: list of individual outputs of each test step.
         """
-        return self.validation_epoch_end(outputs)
+        return self.on_validation_epoch_end()
 
     # Functions for inference
 
     @torch.no_grad()
     def infer(self, dataloader_cfg: DictConfig, input_name: str, output_name: str) -> None:
-        """ Main function for Inference
+        """Main function for Inference
 
         Args:
             dataloader_cfg: config for dataloader
@@ -507,7 +520,7 @@ class SpellcheckingAsrCustomizationModel(NLPModel):
         Setup function for a infer data loader.
         Args:
             cfg: config dictionary containing data loader params like batch_size, num_workers and pin_memory
-            input_name: path to input file. 
+            input_name: path to input file.
         Returns:
             A pytorch DataLoader.
         """

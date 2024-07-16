@@ -243,6 +243,10 @@ class MegatronT5Model(MegatronLMEncoderDecoderModel):
         logging.info(f'Length of val dataset: {len(self._validation_ds)}')
         logging.info(f'Length of test dataset: {len(self._test_ds)}')
         logging.info(f'Finished building {self.model_name} datasets.')
+
+        # Override limit_val_batches to be a multiple of num microbatches to prevent val_step from exiting in between a step
+        self._reconfigure_limit_batches(self.trainer.limit_val_batches, self._validation_dl, 'val')
+
         return self._train_ds, self._validation_ds, self._test_ds
 
     def list_available_models(self):

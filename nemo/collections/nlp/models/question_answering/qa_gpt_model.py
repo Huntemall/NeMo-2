@@ -27,10 +27,14 @@ from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import Meg
 from nemo.collections.nlp.models.question_answering.qa_base_model import BaseQAModel
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.utils import logging
+from nemo.utils.decorators import deprecated_warning
 
 
 class GPTQAModel(BaseQAModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
+        # deprecation warning
+        deprecated_warning("GPTQAModel")
+
         self.cfg = cfg
 
         self.setup_tokenizer(cfg.tokenizer)
@@ -64,7 +68,7 @@ class GPTQAModel(BaseQAModel):
         generated_answers = self._generate_candidates(input_ids, input_attn_mask, training_mask_end)
         labels[labels == -100] = self.tokenizer.tokenizer.pad_token_id
 
-        return {
+        loss = {
             "unique_ids": unique_ids,
             f"{prefix}_loss": loss,
             "per_sample_perplexity": per_sample_perplexity,
@@ -72,23 +76,41 @@ class GPTQAModel(BaseQAModel):
             "ground_truth_answers": self.tokenizer.tokenizer.batch_decode(labels, skip_special_tokens=True),
             "generated_answers": generated_answers,
         }
+        if prefix == 'val':
+            self.validation_step_outputs.append(loss)
+        else:
+            self.test_step_outputs.append(loss)
+
+        return loss
 
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
         prefix = "test" if self.trainer.testing else "val"
 
-        loss_terms = [x[f"{prefix}_loss"] for x in outputs]
-        generated_answers, unique_ids, per_sample_perplexity = QAMetrics.convert_dict_outputs_to_lists(
-            outputs, ["generated_answers", "unique_ids", "per_sample_perplexity"]
-        )
+        if prefix == 'val':
+            loss_terms = [x[f"{prefix}_loss"] for x in self.validation_step_outputs]
+            generated_answers, unique_ids, per_sample_perplexity = QAMetrics.convert_dict_outputs_to_lists(
+                self.validation_step_outputs, ["generated_answers", "unique_ids", "per_sample_perplexity"]
+            )
+            self.validation_step_outputs.clear()  # free memory
+        else:
+            loss_terms = [x[f"{prefix}_loss"] for x in self.test_step_outputs]
+            generated_answers, unique_ids, per_sample_perplexity = QAMetrics.convert_dict_outputs_to_lists(
+                self.test_step_outputs, ["generated_answers", "unique_ids", "per_sample_perplexity"]
+            )
+            self.test_step_outputs.clear()  # free memory
 
         avg_loss = torch.stack(loss_terms).mean()
 
         eval_dataset = self._test_dl.dataset if self.trainer.testing else self._validation_dl.dataset
         eval_results, _, _ = self.evaluate(
-            eval_dataset.features, eval_dataset.examples, unique_ids, per_sample_perplexity, generated_answers,
+            eval_dataset.features,
+            eval_dataset.examples,
+            unique_ids,
+            per_sample_perplexity,
+            generated_answers,
         )
 
         self.log(f'{prefix}_loss', avg_loss)
@@ -96,8 +118,8 @@ class GPTQAModel(BaseQAModel):
             logging.info(f"{prefix} {eval_key}: {eval_results[eval_key]}")
             self.log(f"{prefix}_{eval_key}", eval_results[eval_key])
 
-    def test_epoch_end(self, outputs):
-        self.validation_epoch_end(outputs)
+    def on_test_epoch_end(self):
+        self.on_validation_epoch_end()
 
     @typecheck()
     def forward(self, input_ids, input_attn_mask, labels):
@@ -171,10 +193,19 @@ class GPTQAModel(BaseQAModel):
         return all_predictions, all_nbest_perdictions
 
     def evaluate(
-        self, features, examples, unique_ids, per_sample_perplexity, generated_texts,
+        self,
+        features,
+        examples,
+        unique_ids,
+        per_sample_perplexity,
+        generated_texts,
     ):
         all_predictions, all_nbest_predictions = self._get_predictions(
-            features, examples, unique_ids, per_sample_perplexity, generated_texts,
+            features,
+            examples,
+            unique_ids,
+            per_sample_perplexity,
+            generated_texts,
         )
 
         eval_results = QAMetrics.evaluate_predictions(examples, all_predictions)
@@ -212,7 +243,12 @@ class GPTQAModel(BaseQAModel):
         return data_loader
 
     def _get_predictions(
-        self, features, examples: List, unique_ids: List[int], per_sample_perplexity: List, generated_texts: List,
+        self,
+        features,
+        examples: List,
+        unique_ids: List[int],
+        per_sample_perplexity: List,
+        generated_texts: List,
     ):
         unique_id_to_pos = {}
         for index, unique_id in enumerate(unique_ids):
@@ -228,7 +264,7 @@ class GPTQAModel(BaseQAModel):
 
         all_predictions = collections.OrderedDict()
         all_nbest_json = collections.OrderedDict()
-        for (example_index, example) in enumerate(examples):
+        for example_index, example in enumerate(examples):
 
             # finish this loop if we went through all batch examples
             if example_index >= len(unique_ids):
@@ -236,7 +272,7 @@ class GPTQAModel(BaseQAModel):
 
             curr_features = example_index_to_features[example_index]
             prelim_predictions = []
-            for (feature_index, feature) in enumerate(curr_features):
+            for feature_index, feature in enumerate(curr_features):
                 pos = unique_id_to_pos[feature.unique_id]
                 curr_perplexity = per_sample_perplexity[pos]
                 curr_generated_text = generated_texts[pos]

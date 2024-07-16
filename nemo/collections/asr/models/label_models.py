@@ -13,11 +13,15 @@
 # limitations under the License.
 import copy
 import itertools
+import os
+import tempfile
+from collections import Counter
 from math import ceil
 from typing import Dict, List, Optional, Union
 
 import librosa
 import numpy as np
+import soundfile as sf
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -32,6 +36,7 @@ from nemo.collections.asr.data.audio_to_label_dataset import (
 )
 from nemo.collections.asr.data.audio_to_text_dataset import convert_to_config_list
 from nemo.collections.asr.models.asr_model import ExportableEncDecModel
+from nemo.collections.asr.parts.mixins.mixins import VerificationMixin
 from nemo.collections.asr.parts.preprocessing.features import WaveformFeaturizer
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
 from nemo.collections.common.metrics import TopKClassificationAccuracy
@@ -44,14 +49,17 @@ from nemo.utils import logging
 __all__ = ['EncDecSpeakerLabelModel']
 
 
-class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
+class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel, VerificationMixin):
     """
     Encoder decoder class for speaker label models.
     Model class creates training, validation methods for setting up data
     performing model forward pass.
     Expects config dict for
+
         * preprocessor
+
         * Jasper/Quartznet Encoder
+
         * Speaker Decoder
     """
 
@@ -131,7 +139,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         if 'loss' in cfg:
             cfg_eval_loss = copy.deepcopy(cfg.loss)
 
-            if 'angular' in cfg.loss._target_:
+            if '_target_' in cfg.loss and 'angular' in cfg.loss._target_:
                 OmegaConf.set_struct(cfg, True)
                 with open_dict(cfg):
                     cfg.decoder.angular = True
@@ -237,6 +245,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
                 max_duration=config.get('max_duration', None),
                 min_duration=config.get('min_duration', None),
                 trim=config.get('trim_silence', False),
+                channel_selector=config.get('channel_selector', None),
                 normalize_audio=config.get('normalize_audio', False),
                 cal_labels_occurrence=config.get('cal_labels_occurrence', False),
             )
@@ -328,15 +337,16 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
             "embs": NeuralType(('B', 'D'), AcousticEncodedRepresentation()),
         }
 
-    def forward_for_export(self, processed_signal, processed_signal_len):
-        encoded, length = self.encoder(audio_signal=processed_signal, length=processed_signal_len)
+    def forward_for_export(self, audio_signal, length):
+        encoded, length = self.encoder(audio_signal=audio_signal, length=length)
         logits, embs = self.decoder(encoder_output=encoded, length=length)
         return logits, embs
 
     @typecheck()
     def forward(self, input_signal, input_signal_length):
         processed_signal, processed_signal_len = self.preprocessor(
-            input_signal=input_signal, length=input_signal_length,
+            input_signal=input_signal,
+            length=input_signal_length,
         )
 
         if self.spec_augmentation is not None and self.training:
@@ -373,13 +383,25 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         self._macro_accuracy.update(preds=logits, target=labels)
         stats = self._macro_accuracy._final_state()
 
-        return {
+        output = {
             f'{tag}_loss': loss_value,
             f'{tag}_correct_counts': correct_counts,
             f'{tag}_total_counts': total_counts,
             f'{tag}_acc_micro_top_k': acc_top_k,
             f'{tag}_acc_macro_stats': stats,
         }
+        if tag == 'val':
+            if isinstance(self.trainer.val_dataloaders, (list, tuple)) and len(self.trainer.val_dataloaders) > 1:
+                self.validation_step_outputs[dataloader_idx].append(output)
+            else:
+                self.validation_step_outputs.append(output)
+        else:
+            if isinstance(self.trainer.test_dataloaders, (list, tuple)) and len(self.trainer.test_dataloaders) > 1:
+                self.test_step_outputs[dataloader_idx].append(output)
+            else:
+                self.test_step_outputs.append(output)
+
+        return output
 
     def multi_evaluation_epoch_end(self, outputs, dataloader_idx: int = 0, tag: str = 'val'):
         loss_mean = torch.stack([x[f'{tag}_loss'] for x in outputs]).mean()
@@ -432,7 +454,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
             emb: speaker embeddings (Audio representations)
             logits: logits corresponding of final layer
         """
-        audio, sr = librosa.load(path2audio_file, sr=None)
+        audio, sr = sf.read(path2audio_file)
         target_sr = self._cfg.train_ds.get('sample_rate', 16000)
         if sr != target_sr:
             audio = librosa.core.resample(audio, orig_sr=sr, target_sr=target_sr)
@@ -440,7 +462,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         device = self.device
         audio = np.array([audio])
         audio_signal, audio_signal_len = (
-            torch.tensor(audio, device=device),
+            torch.tensor(audio, device=device, dtype=torch.float32),
             torch.tensor([audio_length], device=device),
         )
         mode = self.training
@@ -454,25 +476,78 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         del audio_signal, audio_signal_len
         return emb, logits
 
-    def get_label(self, path2audio_file):
+    @torch.no_grad()
+    def infer_segment(self, segment):
+        """
+        Args:
+            segment: segment of audio file
+
+        Returns:
+            emb: speaker embeddings (Audio representations)
+            logits: logits corresponding of final layer
+        """
+        segment_length = segment.shape[0]
+
+        device = self.device
+        audio = np.array([segment])
+        audio_signal, audio_signal_len = (
+            torch.tensor(audio, device=device, dtype=torch.float32),
+            torch.tensor([segment_length], device=device),
+        )
+        mode = self.training
+        self.freeze()
+
+        logits, emb = self.forward(input_signal=audio_signal, input_signal_length=audio_signal_len)
+
+        self.train(mode=mode)
+        if mode is True:
+            self.unfreeze()
+        del audio_signal, audio_signal_len
+        return emb, logits
+
+    def get_label(
+        self, path2audio_file: str, segment_duration: float = np.inf, num_segments: int = 1, random_seed: int = None
+    ):
         """
         Returns label of path2audio_file from classes the model was trained on.
         Args:
-            path2audio_file: path to audio wav file
+            path2audio_file (str): Path to audio wav file.
+            segment_duration (float): Random sample duration in seconds.
+            num_segments (int): Number of segments of file to use for majority vote.
+            random_seed (int): Seed for generating the starting position of the segment.
 
         Returns:
             label: label corresponding to the trained model
         """
-        _, logits = self.infer_file(path2audio_file=path2audio_file)
+        audio, sr = sf.read(path2audio_file)
+        target_sr = self._cfg.train_ds.get('sample_rate', 16000)
+        if sr != target_sr:
+            audio = librosa.core.resample(audio, orig_sr=sr, target_sr=target_sr)
+        audio_length = audio.shape[0]
+
+        duration = target_sr * segment_duration
+        if duration > audio_length:
+            duration = audio_length
+
+        label_id_list = []
+        np.random.seed(random_seed)
+        starts = np.random.randint(0, audio_length - duration + 1, size=num_segments)
+        for start in starts:
+            audio = audio[start : start + duration]
+
+            _, logits = self.infer_segment(audio)
+            label_id = logits.argmax(axis=1)
+            label_id_list.append(int(label_id[0]))
+
+        m_label_id = Counter(label_id_list).most_common(1)[0][0]
 
         trained_labels = self._cfg['train_ds'].get('labels', None)
         if trained_labels is not None:
             trained_labels = list(trained_labels)
-            label_id = logits.argmax(axis=1)
-            label = trained_labels[int(label_id[0])]
+            label = trained_labels[m_label_id]
         else:
             logging.info("labels are not saved to model, hence only outputting the label id index")
-            label = logits.argmax(axis=1)
+            label = m_label_id
 
         return label
 
@@ -512,6 +587,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         # Score
         similarity_score = torch.dot(X, Y) / ((torch.dot(X, X) * torch.dot(Y, Y)) ** 0.5)
         similarity_score = (similarity_score + 1) / 2
+
         # Decision
         if similarity_score >= threshold:
             logging.info(" two audio files are from same speaker")
@@ -519,6 +595,58 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         else:
             logging.info(" two audio files are from different speakers")
             return False
+
+    @torch.no_grad()
+    def verify_speakers_batch(self, audio_files_pairs, threshold=0.7, batch_size=32, sample_rate=16000, device='cuda'):
+        """
+        Verify if audio files from the first and second manifests are from the same speaker or not.
+
+        Args:
+            audio_files_pairs: list of tuples with audio_files pairs to be verified
+            threshold: cosine similarity score used as a threshold to distinguish two embeddings (default = 0.7)
+            batch_size: batch size to perform batch inference
+            sample_rate: sample rate of audio files in manifest file
+            device: compute device to perform operations.
+
+        Returns:
+            True if both audio pair is from same speaker, False otherwise
+        """
+
+        if type(audio_files_pairs) is list:
+            tmp_dir = tempfile.TemporaryDirectory()
+            manifest_filepath1 = os.path.join(tmp_dir.name, 'tmp_manifest1.json')
+            manifest_filepath2 = os.path.join(tmp_dir.name, 'tmp_manifest2.json')
+            self.path2audio_files_to_manifest([p[0] for p in audio_files_pairs], manifest_filepath1)
+            self.path2audio_files_to_manifest([p[1] for p in audio_files_pairs], manifest_filepath2)
+        else:
+            raise ValueError("audio_files_pairs must be of type list of tuples containing a pair of audio files")
+
+        embs1, _, _, _ = self.batch_inference(
+            manifest_filepath1, batch_size=batch_size, sample_rate=sample_rate, device=device
+        )
+        embs2, _, _, _ = self.batch_inference(
+            manifest_filepath2, batch_size=batch_size, sample_rate=sample_rate, device=device
+        )
+
+        embs1 = torch.Tensor(embs1).to(device)
+        embs2 = torch.Tensor(embs2).to(device)
+        # Length Normalize
+        embs1 = torch.div(embs1, torch.linalg.norm(embs1, dim=1).unsqueeze(dim=1))
+        embs2 = torch.div(embs2, torch.linalg.norm(embs2, dim=1).unsqueeze(dim=1))
+
+        X = embs1.unsqueeze(dim=1)
+        Y = embs2.unsqueeze(dim=2)
+        # Score
+        similarity_scores = torch.matmul(X, Y).squeeze() / (
+            (torch.matmul(X, X.permute(0, 2, 1)).squeeze() * torch.matmul(Y.permute(0, 2, 1), Y).squeeze()) ** 0.5
+        )
+        similarity_scores = (similarity_scores + 1) / 2
+
+        # Decision
+        decision = similarity_scores >= threshold
+
+        tmp_dir.cleanup()
+        return decision.cpu().numpy()
 
     @torch.no_grad()
     def batch_inference(self, manifest_filepath, batch_size=32, sample_rate=16000, device='cuda'):
@@ -552,13 +680,15 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         if trained_labels is not None:
             trained_labels = list(trained_labels)
 
-        featurizer = WaveformFeaturizer(sample_rate=sample_rate)
-
-        dataset = AudioToSpeechLabelDataset(manifest_filepath=manifest_filepath, labels=None, featurizer=featurizer)
-
-        dataloader = torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, collate_fn=dataset.fixed_seq_collate_fn,
-        )
+        dl_config = {
+            'manifest_filepath': manifest_filepath,
+            'sample_rate': sample_rate,
+            'channel_selector': 0,
+            'batch_size': batch_size,
+        }
+        self.labels = self.extract_labels(dl_config)
+        dl_config['labels'] = self.labels
+        dataloader = self.__setup_dataloader_from_config(config=dl_config)
 
         logits = []
         embs = []
@@ -574,7 +704,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
             gt_labels.extend(labels.cpu().numpy())
             embs.extend(emb.cpu().numpy())
 
-        gt_labels = list(map(lambda t: dataset.id2label[t], gt_labels))
+        gt_labels = list(map(lambda t: dataloader.dataset.id2label[t], gt_labels))
 
         self.train(mode=mode)
         if mode is True:

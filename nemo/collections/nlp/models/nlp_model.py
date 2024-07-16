@@ -16,14 +16,15 @@ import copy
 import hashlib
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Union
 
+import torch
+from lightning_fabric.utilities.cloud_io import _load as pl_load
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 from pytorch_lightning.core.saving import _load_state as ptl_load_state
 from pytorch_lightning.core.saving import load_hparams_from_tags_csv, load_hparams_from_yaml
 from pytorch_lightning.utilities import rank_zero_only
-from pytorch_lightning.utilities.cloud_io import load as pl_load
 from pytorch_lightning.utilities.migration import pl_legacy_patch
 from transformers import TRANSFORMERS_CACHE
 
@@ -39,7 +40,17 @@ from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer
 from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.core.classes import ModelPT
 from nemo.core.classes.exportable import Exportable
+from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 from nemo.utils import AppState, logging
+
+try:
+    from megatron.core import dist_checkpointing, parallel_state
+
+    HAVE_MEGATRON_CORE = True
+
+except (ImportError, ModuleNotFoundError):
+
+    HAVE_MEGATRON_CORE = False
 
 __all__ = ['NLPModel']
 
@@ -49,8 +60,7 @@ os.makedirs(NEMO_NLP_TMP, exist_ok=True)
 
 
 class NLPModel(ModelPT, Exportable):
-    """Base class for NLP Models.
-    """
+    """Base class for NLP Models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None, no_lm_init=False):
 
@@ -109,7 +119,11 @@ class NLPModel(ModelPT, Exportable):
             if cfg.get('language_model').get('config_file'):
                 config_file = self.register_artifact('language_model.config_file', cfg.language_model.config_file)
             bert_model = get_lm_model(
-                config_file=config_file, config_dict=config_dict, vocab_file=vocab_file, trainer=trainer, cfg=cfg,
+                config_file=config_file,
+                config_dict=config_dict,
+                vocab_file=vocab_file,
+                trainer=trainer,
+                cfg=cfg,
             )
             # set the tokenizer if it is not initialized explicitly
             if ((hasattr(self, 'tokenizer') and self.tokenizer is None) or not hasattr(self, 'tokenizer')) and hasattr(
@@ -135,16 +149,18 @@ class NLPModel(ModelPT, Exportable):
             self.register_bert_model()
 
     def register_artifact(
-        self, config_path: str, src: str, verify_src_exists: bool = False,
+        self,
+        config_path: str,
+        src: str,
+        verify_src_exists: bool = False,
     ):
-        """ Overrides ModelPT register_artifact default behavior.
+        """Overrides ModelPT register_artifact default behavior.
         NLP models usually need artifacts that are optional."""
         return super().register_artifact(config_path, src, verify_src_exists=verify_src_exists)
 
     @rank_zero_only
     def register_bert_model(self):
-        """Adds encoder config to .nemo archive for Jarvis.
-        """
+        """Adds encoder config to .nemo archive for Jarvis."""
         # check if there is an encoder, warn if not
         if self.bert_model is not None:
             # get encoder config and create source for artifact
@@ -310,6 +326,20 @@ class NLPModel(ModelPT, Exportable):
         checkpoint = None
         try:
             cls._set_model_restore_state(is_being_restored=True)
+
+            # dist checkpoint is a dir
+            checkpoint_dir = None
+            if os.path.isdir(checkpoint_path):
+                # store dir for later use
+                checkpoint_dir = checkpoint_path
+
+                # metadata is stored in common.pt
+                checkpoint_path = os.path.join(checkpoint_path, 'common.pt')
+
+                # we defer loading the state_dict until the class has been initialized
+                # we need to set this for ptl_load_state
+                strict = False
+
             # TODO: replace with proper PTL API
             with pl_legacy_patch():
                 if map_location is not None:
@@ -342,7 +372,7 @@ class NLPModel(ModelPT, Exportable):
                 config_kwargs.pop('trainer')
             cfg.update(config_kwargs)
 
-            if cfg.get('megatron_amp_O2', False):
+            if cfg.get('megatron_amp_O2', False) and checkpoint_dir is None:
                 new_state_dict = {}
                 for key in checkpoint['state_dict'].keys():
                     new_key = key.replace('model.', 'model.module.', 1)
@@ -354,6 +384,26 @@ class NLPModel(ModelPT, Exportable):
             else:
                 model = ptl_load_state(cls, checkpoint, strict=strict, cfg=cfg, **kwargs)
                 # cfg = checkpoint[cls.CHECKPOINT_HYPER_PARAMS_KEY].cfg
+
+            # if the checkpoint is distributed, we deferred loading the state_dict until now
+            if checkpoint_dir is not None:
+                # dist checkpointing needs torch.distributed to load the checkpoint
+                if not parallel_state.is_initialized():
+
+                    def dummy():
+                        return
+
+                    if model.trainer.strategy.launcher is not None:
+                        model.trainer.strategy.launcher.launch(dummy, trainer=model.trainer)
+                    model.trainer.strategy.setup_environment()
+                sharded_state_dict = model.sharded_state_dict()
+                checkpoint['state_dict'] = sharded_state_dict
+                # load the checkpoint from disk
+                checkpoint = dist_checkpointing.load(sharded_state_dict=checkpoint, checkpoint_dir=checkpoint_dir)
+                # restore the weights
+                model.on_load_checkpoint(checkpoint)
+                if hasattr(model, 'setup_transformer_engine_tp_groups'):
+                    model.setup_transformer_engine_tp_groups()
 
             # NMT models do not have a `tokenizer` attribute, they instead have an encoder_tokenizer and decoder_tokenizer attribute.
             if hasattr(cfg, "tokenizer"):
@@ -385,3 +435,53 @@ class NLPModel(ModelPT, Exportable):
         finally:
             cls._set_model_restore_state(is_being_restored=False)
         return checkpoint
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True):
+        # starting with trasformers v4.31.0, buffer for position_ids is persistent=False
+        if (
+            self.bert_model is not None
+            and "position_ids" not in self.bert_model.embeddings._modules
+            and "bert_model.embeddings.position_ids" in state_dict
+        ):
+            del state_dict["bert_model.embeddings.position_ids"]
+        else:
+            # fix for albert and other models
+            pos_id_keys = [x for x in state_dict.keys() if "position_ids" in x]
+            for key in pos_id_keys:
+                del state_dict[key]
+        results = super(NLPModel, self).load_state_dict(state_dict, strict=strict)
+        return results
+
+    @classmethod
+    def restore_from(
+        cls,
+        restore_path: str,
+        override_config_path: Optional[Union[OmegaConf, str]] = None,
+        map_location: Optional[torch.device] = None,
+        strict: bool = True,
+        return_config: bool = False,
+        save_restore_connector: SaveRestoreConnector = None,
+        trainer: Optional[Trainer] = None,
+        validate_access_integrity: bool = True,
+    ):
+        if save_restore_connector is None:
+            save_restore_connector = NLPSaveRestoreConnector()
+        if os.path.isdir(restore_path):
+            save_restore_connector.model_extracted_dir = restore_path
+        if (
+            isinstance(override_config_path, DictConfig)
+            and override_config_path.get('use_cpu_initialization', False)
+            and map_location is None
+        ):
+            logging.info('use_cpu_initialization is True, loading checkpoint on CPU')
+            map_location = 'cpu'
+        return super().restore_from(
+            restore_path,
+            override_config_path,
+            map_location,
+            strict,
+            return_config,
+            save_restore_connector,
+            trainer,
+            validate_access_integrity,
+        )

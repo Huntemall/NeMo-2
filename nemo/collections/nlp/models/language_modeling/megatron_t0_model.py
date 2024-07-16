@@ -23,18 +23,9 @@ from nemo.collections.nlp.data.language_modeling.megatron.megatron_batch_sampler
     MegatronPretrainingBatchSampler,
 )
 from nemo.collections.nlp.data.language_modeling.t0_dataset import T0Dataset
-from nemo.collections.nlp.models.language_modeling.megatron_finetune_model import MegatronT5FinetuneModel
+from nemo.collections.nlp.models.language_modeling.megatron_t5_sft_model import MegatronT5SFTModel
 from nemo.utils import AppState, logging
-
-try:
-    from apex.transformer.pipeline_parallel.utils import _reconfigure_microbatch_calculator
-
-    HAVE_APEX = True
-
-except (ImportError, ModuleNotFoundError):
-
-    HAVE_APEX = False
-
+from nemo.utils.apex_utils import _reconfigure_microbatch_calculator
 
 try:
     from megatron.core import parallel_state
@@ -48,8 +39,8 @@ except (ImportError, ModuleNotFoundError):
 __all__ = ['MegatronT0Model']
 
 
-class MegatronT0Model(MegatronT5FinetuneModel):
-    """T0 (https://arxiv.org/abs/2110.08207) Model that Inherits from MegatronT5FinetuneModel and overrides the dataset building."""
+class MegatronT0Model(MegatronT5SFTModel):
+    """T0 (https://arxiv.org/abs/2110.08207) Model that Inherits from MegatronT5SFTModel and overrides the dataset building."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer):
         super().__init__(cfg, trainer=trainer)
@@ -57,7 +48,7 @@ class MegatronT0Model(MegatronT5FinetuneModel):
     def setup(self, stage=None):
         # NOTE: super().__init__ will try and setup train/val/test datasets, but we sidestep this using a if self._train_ds is not None condition
         # We then set things up for real only once setup() of this class is called.
-        resume_checkpoint_path = self.trainer._checkpoint_connector.resume_from_checkpoint_fit_path
+        resume_checkpoint_path = self.trainer.ckpt_path
         if resume_checkpoint_path:
             init_consumed_samples = self._extract_consumed_samples_from_ckpt(resume_checkpoint_path)
         else:
@@ -154,7 +145,7 @@ class MegatronT0Model(MegatronT5FinetuneModel):
             return datasets
 
     def training_step(self, dataloader_iter, batch_idx):
-        return super(MegatronT5FinetuneModel, self).training_step(dataloader_iter, batch_idx)
+        return super().training_step(dataloader_iter, batch_idx)
 
     # Override the parent batch reconfiguring logic.
     def _reconfigure_and_process_inference_batch(self, batch):
@@ -194,7 +185,10 @@ class MegatronT0Model(MegatronT5FinetuneModel):
         logging.info(f'Length of train dataset: {len(self._train_ds)}')
 
     def build_data_loader(
-        self, dataset, data_cfg, consumed_samples=0,
+        self,
+        dataset,
+        data_cfg,
+        consumed_samples=0,
     ):
         """Buld dataloader given an input dataset."""
         logging.info(f'Building dataloader with consumed samples: {consumed_samples}')
@@ -224,22 +218,28 @@ class MegatronT0Model(MegatronT5FinetuneModel):
         if hasattr(self, '_train_ds'):
             consumed_samples = self.compute_consumed_samples(0)
             self._train_dl = self.build_data_loader(
-                dataset=self._train_ds, data_cfg=self.cfg.data.train_ds, consumed_samples=consumed_samples,
+                dataset=self._train_ds,
+                data_cfg=self.cfg.data.train_ds,
+                consumed_samples=consumed_samples,
             )
 
     def setup_eval_dataloader(self, datasets, data_cfg):
         dataloaders = []
         for dataset in datasets:
-            eval_dl = self.build_data_loader(dataset=dataset, data_cfg=data_cfg, consumed_samples=0,)
+            eval_dl = self.build_data_loader(
+                dataset=dataset,
+                data_cfg=data_cfg,
+                consumed_samples=0,
+            )
             dataloaders.append(eval_dl)
         return dataloaders
 
     # TODO: Temporary overrides of finetune model. This needs to removed in the finetune model.
     def on_train_start(self) -> None:
-        super(MegatronT5FinetuneModel, self).on_train_start()
+        super().on_train_start()
 
     def on_validation_start(self) -> None:
-        super(MegatronT5FinetuneModel, self).on_validation_start()
+        super().on_validation_start()
 
     def on_test_start(self) -> None:
-        super(MegatronT5FinetuneModel, self).on_test_start()
+        super().on_test_start()

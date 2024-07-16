@@ -23,13 +23,13 @@ from pytorch_lightning import Trainer
 
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.models.hybrid_rnnt_ctc_models import EncDecHybridRNNTCTCModel
+from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.utils.asr_confidence_utils import (
     ConfidenceConfig,
     ConfidenceMethodConfig,
     get_confidence_aggregation_bank,
     get_confidence_measure_bank,
 )
-from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.core.classes import ModelPT
 from nemo.utils import model_utils
@@ -62,7 +62,10 @@ class ConfidenceSpec:
             exclude_blank=self.exclude_blank,
             aggregation=self.aggregation,
             method_cfg=ConfidenceMethodConfig(
-                name=name, entropy_type=entropy_type, temperature=self.alpha, entropy_norm=entropy_norm,
+                name=name,
+                entropy_type=entropy_type,
+                alpha=self.alpha,
+                entropy_norm=entropy_norm,
             ),
         )
 
@@ -106,6 +109,11 @@ def get_filtered_logprobs(hypothesis: Hypothesis, exclude_blank: bool) -> torch.
                 filtered_logprobs = logprobs[:1]
         else:
             filtered_logprobs = logprobs
+
+    # need to make sure logprobs are always normalized, so checking if they sum up to 1
+    if not torch.allclose(filtered_logprobs[0].exp().sum(), torch.tensor(1.0)):
+        filtered_logprobs = torch.log_softmax(filtered_logprobs, dim=1)
+
     return filtered_logprobs
 
 
@@ -121,7 +129,7 @@ def compute_confidence(hypothesis: Hypothesis, confidence_cfg: ConfidenceConfig)
         hypothesis: generated hypothesis as returned from the transcribe
             method of the ASR model.
         confidence_cfg: confidence config specifying what kind of
-            measure/aggregation should be used.
+            method/aggregation should be used.
 
     Returns:
         float: confidence score.
@@ -135,7 +143,7 @@ def compute_confidence(hypothesis: Hypothesis, confidence_cfg: ConfidenceConfig)
         alpha = 1.0
     else:
         conf_type = f"entropy_{confidence_cfg.method_cfg.entropy_type}_{confidence_cfg.method_cfg.entropy_norm}"
-        alpha = confidence_cfg.method_cfg.temperature
+        alpha = confidence_cfg.method_cfg.alpha
     conf_func = get_confidence_measure_bank()[conf_type]
 
     conf_value = aggr_func(conf_func(filtered_logprobs, v=vocab_size, t=alpha)).cpu().item()
@@ -146,11 +154,17 @@ def compute_confidence(hypothesis: Hypothesis, confidence_cfg: ConfidenceConfig)
 class ConfidenceEnsembleModel(ModelPT):
     """Implementation of the confidence ensemble model.
 
-    See <PAPER TBD> for details.
+    See https://arxiv.org/abs/2306.15824 for details.
+
+    .. note::
+        Currently this class only support `transcribe` method as it requires
+        full-utterance confidence scores to operate.
     """
 
     def __init__(
-        self, cfg: DictConfig, trainer: 'Trainer' = None,
+        self,
+        cfg: DictConfig,
+        trainer: 'Trainer' = None,
     ):
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -171,7 +185,9 @@ class ConfidenceEnsembleModel(ModelPT):
                 model_cfg = self.cfg[cfg_field]
                 model_class = model_utils.import_class_by_path(model_cfg['target'])
                 self.register_nemo_submodule(
-                    name=cfg_field, config_field=cfg_field, model=model_class(model_cfg, trainer=trainer),
+                    name=cfg_field,
+                    config_field=cfg_field,
+                    model=model_class(model_cfg, trainer=trainer),
                 )
         else:
             self.num_models = len(cfg.load_models)
@@ -187,7 +203,9 @@ class ConfidenceEnsembleModel(ModelPT):
                     )
                 else:
                     self.register_nemo_submodule(
-                        cfg_field, config_field=cfg_field, model=ASRModel.from_pretrained(model, map_location="cpu"),
+                        cfg_field,
+                        config_field=cfg_field,
+                        model=ASRModel.from_pretrained(model, map_location="cpu"),
                     )
 
         # registering model selection block - this is expected to be a joblib-saved
@@ -201,7 +219,7 @@ class ConfidenceEnsembleModel(ModelPT):
         for model_idx in range(self.num_models):
             model = getattr(self, f"model{model_idx}")
             # for now we assume users are direclty responsible for matching
-            # decoder type when building ensemlbe with inference type
+            # decoder type when building ensemble with inference type
             # TODO: add automatic checks for errors
             if isinstance(model, EncDecHybridRNNTCTCModel):
                 self.update_decoding_parameters(model.cfg.decoding)
@@ -213,14 +231,10 @@ class ConfidenceEnsembleModel(ModelPT):
                 model.change_decoding_strategy(model.cfg.decoding)
 
     def update_decoding_parameters(self, decoding_cfg: DictConfig):
-        """Updating temperature/preserve_alignment/preserve_frame_confidence parameters of the config."""
+        """Updating temperature/preserve_alignment parameters of the config."""
         with open_dict(decoding_cfg):
             decoding_cfg.temperature = self.cfg.temperature
             decoding_cfg.preserve_alignments = True
-            if 'confidence_cfg' in decoding_cfg:
-                decoding_cfg.confidence_cfg.preserve_frame_confidence = True
-            else:
-                decoding_cfg.confidence_cfg = ConfidenceConfig(preserve_frame_confidence=True)
 
     def setup_training_data(self, train_data_config: Union[DictConfig, Dict]):
         """Pass-through to the ensemble models.

@@ -120,7 +120,7 @@ class SchedulerNoOpCallback(Callback):
                 scheduler.scheduler.step()
 
             # Increase the max step count by 1
-            trainer.fit_loop.max_steps = trainer.fit_loop.max_steps + 1
+            trainer.fit_loop.epoch_loop.max_steps = trainer.fit_loop.epoch_loop.max_steps + 1
 
     def assert_counts(self, trainer, module, count):
         num_skips = module.max_steps // 3
@@ -143,7 +143,7 @@ class TestOptimizersSchedulers:
             model.cuda()
 
         for opt_name in AVAILABLE_OPTIMIZERS.keys():
-            if opt_name == 'fused_adam':
+            if opt_name == 'fused_adam' or opt_name == 'megatron_fused_adam':
                 if not torch.cuda.is_available():
                     continue
             if opt_name == 'distributed_fused_adam':

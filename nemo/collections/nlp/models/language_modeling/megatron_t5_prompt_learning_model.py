@@ -25,8 +25,8 @@ from nemo.collections.nlp.data.language_modeling.megatron.t5_prompt_learning_dat
 from nemo.collections.nlp.models.language_modeling.megatron_base_prompt_learning_model import (
     MegatronBasePromptLearningModel,
 )
-from nemo.collections.nlp.models.language_modeling.megatron_finetune_model import MegatronT5FinetuneModel
 from nemo.collections.nlp.models.language_modeling.megatron_t5_model import MegatronT5Model
+from nemo.collections.nlp.models.language_modeling.megatron_t5_sft_model import MegatronT5SFTModel
 from nemo.collections.nlp.modules.common.megatron.utils import (
     average_losses_across_data_parallel_group,
     get_iterator_k_split,
@@ -34,23 +34,12 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
 from nemo.collections.nlp.parts.nlp_overrides import NLPSaveRestoreConnector
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.utils import AppState, logging
-
-try:
-    from apex.transformer.pipeline_parallel.utils import (
-        _reconfigure_microbatch_calculator,
-        get_micro_batch_size,
-        get_num_microbatches,
-    )
-
-    HAVE_APEX = True
-
-except (ImportError, ModuleNotFoundError):
-
-    HAVE_APEX = False
+from nemo.utils.apex_utils import _reconfigure_microbatch_calculator, get_micro_batch_size
 
 try:
     from megatron.core import parallel_state
     from megatron.core.enums import ModelType
+    from megatron.core.num_microbatches_calculator import get_num_microbatches
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
     HAVE_MEGATRON_CORE = True
@@ -65,21 +54,21 @@ __all__ = ['MegatronT5PromptLearningModel']
 
 class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
     """
-    Model class for prompt-tuning or p-tuning a pretrained Megatron T5 model. 
+    Model class for prompt-tuning or p-tuning a pretrained Megatron T5 model.
 
     Prompt Tuning initalizes virtual prompt embeddings directly from a copy of
     certain token embeddings from the the pretrained T5 model's vocabulary
-    and directly tunes these embedding weights. The token embeddings used in 
-    initalization are specified by the user in the config file. The model can 
-    be prompt-tuned for multiple tasks at once. Virtual prompts are stored in a 
-    prompt table and can be added or deleted without disrupting virtual prompts 
-    for other tasks. 
+    and directly tunes these embedding weights. The token embeddings used in
+    initalization are specified by the user in the config file. The model can
+    be prompt-tuned for multiple tasks at once. Virtual prompts are stored in a
+    prompt table and can be added or deleted without disrupting virtual prompts
+    for other tasks.
 
     P-tuning initializes an LSTM encoder model that generates virtual prompt
     embeddings for every task. Each task shares the same encoder. After p-tuning
     is compelete, the learned virtual prompts can be saved to the prompt table
-    using add_ptuned_prompts_to_prompt_table(). Thus, if a user wants to add a 
-    new virtual prompt via p-tuning, they do not need to retrain on all previous 
+    using add_ptuned_prompts_to_prompt_table(). Thus, if a user wants to add a
+    new virtual prompt via p-tuning, they do not need to retrain on all previous
     tasks. This gives p-tuning the same task flexiblity as prompt-tuning.
     """
 
@@ -93,7 +82,15 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
         return False
 
     def forward(
-        self, input_ids, dec_input, enc_mask, dec_mask, position_ids, taskname_ids, labels=None, inference=False,
+        self,
+        input_ids,
+        dec_input,
+        enc_mask,
+        dec_mask,
+        position_ids,
+        taskname_ids,
+        labels=None,
+        inference=False,
     ):
         """
         Special forward method for p-tuning/prompt-tuning pretrained
@@ -147,7 +144,7 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
         return output, encoder_input
 
     def load_frozen_model(self, cfg, trainer):
-        self.megatron_amp_o2 = cfg.get('megatron_amp_O2', False)
+        self.megatron_amp_O2 = cfg.get('megatron_amp_O2', False)
 
         # TODO: Fix this once apex patches FusedScaledMaskedSoftmax.
         # This is a workaround for the fact that `masked_softmax_fusion` has issues with certain input sizes that may be present while finetuning.
@@ -159,7 +156,7 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
                 t5_cfg.decoder.masked_softmax_fusion = False
             else:
                 t5_cfg.masked_softmax_fusion = False
-            t5_cfg.megatron_amp_O2 = self.megatron_amp_o2
+            t5_cfg.megatron_amp_O2 = self.megatron_amp_O2
             # hack to make the _GLOBAL_NUM_MICROBATCHES_CALCULATOR initialize
             t5_cfg.micro_batch_size = cfg.get('micro_batch_size', 4)
             t5_cfg.global_batch_size = cfg.get('global_batch_size', 4)
@@ -174,14 +171,13 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
 
     def fwd_bwd_step(self, dataloader_iter, batch_idx, forward_only):
         """
-            Dataloader produces a global batch which is turned into a list of microbatches.
-            The list of microbatches is then piped through the pipeline using megatron-core fwd/bwd functions.
+        Dataloader produces a global batch which is turned into a list of microbatches.
+        The list of microbatches is then piped through the pipeline using megatron-core fwd/bwd functions.
         """
         # Get seq length of batch
         batch = next(dataloader_iter)
         _, seq_length = batch[0].shape
         _, dec_seq_length = batch[1].shape
-        tensor_shape = [seq_length, get_micro_batch_size(), self.hidden_size]
         data_iter = get_iterator_k_split(batch, get_num_microbatches())
 
         fwd_bwd_function = get_forward_backward_func()
@@ -192,18 +188,15 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
             model=[self],
             num_microbatches=get_num_microbatches(),
             forward_only=forward_only,
-            tensor_shape=tensor_shape,
+            seq_length=seq_length,
+            micro_batch_size=get_micro_batch_size(),
             decoder_seq_length=dec_seq_length,
-            dtype=self.autocast_dtype,
-            grad_scaler=self.trainer.precision_plugin.scaler.scale if self.cfg.precision == 16 else None,
-            sequence_parallel=self.cfg.get('sequence_parallel', False),
-            enable_autocast=self.enable_autocast,
         )
 
         # only the last stages of the pipeline return losses
         if losses_reduced_per_micro_batch:
             # average loss across micro batches
-            loss_tensors_list = [loss_reduced['avg'] for loss_reduced in losses_reduced_per_micro_batch]
+            loss_tensors_list = [loss_reduced['loss'] for loss_reduced in losses_reduced_per_micro_batch]
             loss_tensor = torch.concat(loss_tensors_list)
             loss_mean = loss_tensor.mean()
         else:
@@ -213,6 +206,7 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
         return loss_mean
 
     def get_forward_output_and_loss_func(self):
+        # FIXME: consolidate this method into MegatronLMEncoderDecoderModel (or have a common base class)
         def fwd_output_and_loss_func(dataloader_iter, model):
             batch = next(dataloader_iter)
             batch = [x.cuda(non_blocking=True) for x in batch]
@@ -226,22 +220,22 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
             def loss_func(output_tensor):
                 loss = self.frozen_model.loss_func(loss_mask, output_tensor)
                 reduced_loss = average_losses_across_data_parallel_group([loss])
-                return loss, {'avg': reduced_loss}
+                return loss, {'loss': reduced_loss}
 
             return output_tensor, loss_func
 
         return fwd_output_and_loss_func
 
     def backward(self, *args, **kwargs):
-        """ LightningModule hook to do backward.
-            We want this to do nothing since we run backward in the fwd/bwd functions from megatron-core.
-            No need to call it here.
+        """LightningModule hook to do backward.
+        We want this to do nothing since we run backward in the fwd/bwd functions from megatron-core.
+        No need to call it here.
         """
         return
 
     def optimizer_zero_grad(self, *args, **kwargs):
-        """ LightningModule hook to zero grad.
-            We want this to do nothing as we are zeroing grads during the training_step.
+        """LightningModule hook to zero grad.
+        We want this to do nothing as we are zeroing grads during the training_step.
         """
         return
 
@@ -277,7 +271,7 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
         # we can avoid this broadcast by updating the PTL log function to accept specific ranks
         torch.distributed.broadcast(loss_mean, get_last_rank())
 
-        if self.cfg.precision == 16 and hasattr(self.trainer.precision_plugin.scaler, "_scale"):
+        if self.torch_dtype == torch.float16 and hasattr(self.trainer.precision_plugin.scaler, "_scale"):
             loss_scale = self.trainer.precision_plugin.scaler._scale
             if loss_scale is not None:
                 self.log('loss_scale', loss_scale, batch_size=1)
@@ -294,14 +288,14 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
             enc_mask=enc_mask,
             num_tokens_to_generate=self.decoder_seq_length,
             encoder_input=encoder_input,
-            bos_id=self.tokenizer.pad_id
-            if self.cfg.data.get('decoder_starts_with_pad', False)
-            else self.tokenizer.bos_id,
+            bos_id=(
+                self.tokenizer.pad_id if self.cfg.data.get('decoder_starts_with_pad', False) else self.tokenizer.bos_id
+            ),
         )
         # Special ids to text function to handle stripping <eos> and special tokens with sentencepiece tokenizers.
-        preds_text = MegatronT5FinetuneModel.ids_to_text(predicted_token_ids, self.tokenizer)
-        labels_text = MegatronT5FinetuneModel.ids_to_text(labels, self.tokenizer)
-        input_text = MegatronT5FinetuneModel.ids_to_text(input_ids, self.tokenizer)
+        preds_text = MegatronT5SFTModel.ids_to_text(predicted_token_ids, self.tokenizer)
+        labels_text = MegatronT5SFTModel.ids_to_text(labels, self.tokenizer)
+        input_text = MegatronT5SFTModel.ids_to_text(input_ids, self.tokenizer)
         return {
             'predicted_token_ids': preds_text,
             'labels': labels_text,
@@ -309,6 +303,7 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
         }
 
     def validation_step(self, batch, batch_idx, inference=False):
+        prefix = "test" if self.trainer.testing else "val"
         input_ids, dec_input, labels, loss_mask, enc_mask, dec_mask, position_ids, taskname_ids = batch
         # does not use dataloader_iter due to device placement issues arising from PTL
         mode = self.training
@@ -339,9 +334,13 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
 
         self.train(mode=mode)
         self.frozen_model.eval()
+        self.validation_step_outputs.append(metrics) if prefix == 'val' else self.test_step_outputs.append(metrics)
         return metrics
 
-    def validation_epoch_end(self, outputs):
+    def on_validation_epoch_end(self):
+        prefix = "test" if self.trainer.testing else "val"
+        outputs = self.validation_step_outputs if prefix == 'val' else self.test_step_outputs
+
         if self.cfg.get('pipeline_model_parallel_size', 1) > 1:
             if parallel_state.is_pipeline_last_stage():
                 # only the last pipeline parallel stages return loss
@@ -383,7 +382,8 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
                 gather_results_dedup = list(set(itertools.chain(*gather_results)))
 
                 val_metric_dict = self.validation_metric.get_score(
-                    [i[2] for i in gather_results_dedup], [i[1] for i in gather_results_dedup],
+                    [i[2] for i in gather_results_dedup],
+                    [i[1] for i in gather_results_dedup],
                 )
 
                 for metric, val in val_metric_dict.items():
@@ -400,11 +400,13 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
         mbs = self.cfg.micro_batch_size
         self._reconfigure_batch_sizes(gbs, mbs)
 
+        self.validation_step_outputs.clear() if prefix == 'val' else self.test_step_outputs.clear()  # free memory
+
     def test_step(self, batch, batch_idx):
         return self.validation_step(batch, batch_idx)
 
-    def test_epoch_end(self, outputs):
-        self.validation_epoch_end(outputs)
+    def on_test_epoch_end(self):
+        self.on_validation_epoch_end()
 
     def build_virtual_prompt_dataset(
         self, dataset_paths, batch_size, for_train, drop_last, shuffle, num_workers, pin_memory
@@ -441,9 +443,9 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
             drop_last=drop_last,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            persistent_workers=True
-            if num_workers > 0
-            else False,  # (@adithyare and @eharper) We need to set this to True to get around issues with spawn=True
+            persistent_workers=(
+                True if num_workers > 0 else False
+            ),  # (@adithyare and @eharper) We need to set this to True to get around issues with spawn=True
         )
         print('build success', len(dataloader), dataset_paths)
         return dataset, dataloader
@@ -473,16 +475,16 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
             enc_mask=enc_mask,
             num_tokens_to_generate=self.decoder_seq_length,
             encoder_input=encoder_input,
-            bos_id=self.tokenizer.pad_id
-            if self.cfg.data.get('decoder_starts_with_pad', False)
-            else self.tokenizer.bos_id,
+            bos_id=(
+                self.tokenizer.pad_id if self.cfg.data.get('decoder_starts_with_pad', False) else self.tokenizer.bos_id
+            ),
         )
         # Special ids to text function to handle stripping <eos> and special tokens with sentencepiece tokenizers.
-        preds_text = MegatronT5FinetuneModel.ids_to_text(predicted_token_ids, self.tokenizer)
-        input_text = MegatronT5FinetuneModel.ids_to_text(input_ids, self.tokenizer)
+        preds_text = MegatronT5SFTModel.ids_to_text(predicted_token_ids, self.tokenizer)
+        input_text = MegatronT5SFTModel.ids_to_text(input_ids, self.tokenizer)
 
         if labels is not None:
-            labels_text = MegatronT5FinetuneModel.ids_to_text(labels, self.tokenizer)
+            labels_text = MegatronT5SFTModel.ids_to_text(labels, self.tokenizer)
         else:
             labels_text = [None] * len(preds_text)
 
@@ -492,12 +494,15 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
             'labels_text': labels_text,
         }
 
-    def on_predict_epoch_end(self, outputs: List[Any]) -> None:
-
+    def on_predict_epoch_end(self) -> None:
+        # PTL 2.0 removes outputs arg from on_predict_epoch_end and is retrived by self.trainer.predict_loop.predictions
+        outputs = self.trainer.predict_loop.predictions
         gather_results = [None for _ in range(parallel_state.get_data_parallel_world_size())]
-        all_preds = list(itertools.chain(*[item['preds_text'] for item in outputs[0]]))
-        all_labels = list(itertools.chain(*[item['labels_text'] for item in outputs[0]]))
-        all_inputs = list(itertools.chain(*[item['input_text'] for item in outputs[0]]))
+        # In case of single dataloader format of self.trainer.predict_loop.predictions is [{dict1},{dict2}] v/s [[{dict1},{dict2}]] of outputs in 1.9
+        # Removing indix [0] to avoid TypeError (https://github.com/Lightning-AI/lightning/pull/16655/files)
+        all_preds = list(itertools.chain(*[item['preds_text'] for item in outputs]))
+        all_labels = list(itertools.chain(*[item['labels_text'] for item in outputs]))
+        all_inputs = list(itertools.chain(*[item['input_text'] for item in outputs]))
 
         assert len(all_preds) == len(all_labels)
         assert len(all_preds) == len(all_inputs)
@@ -515,7 +520,7 @@ class MegatronT5PromptLearningModel(MegatronBasePromptLearningModel):
 
             input_prediction_pair = []
             correct = 0
-            for (input, pred, label) in gather_results_dedup:
+            for input, pred, label in gather_results_dedup:
                 input_prediction_pair.append((input, pred))
                 if label:
                     if pred == label:

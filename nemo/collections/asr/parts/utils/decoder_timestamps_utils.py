@@ -21,10 +21,15 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.metrics.wer import WER, CTCDecoding, CTCDecodingConfig
-from nemo.collections.asr.metrics.wer_bpe import WERBPE, CTCBPEDecoding, CTCBPEDecodingConfig
+from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models import EncDecCTCModel, EncDecCTCModelBPE
-from nemo.collections.asr.parts.utils.audio_utils import get_samples
+from nemo.collections.asr.parts.preprocessing.segment import get_samples
+from nemo.collections.asr.parts.submodules.ctc_decoding import (
+    CTCBPEDecoding,
+    CTCBPEDecodingConfig,
+    CTCDecoding,
+    CTCDecodingConfig,
+)
 from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map, get_uniqname_from_filepath
 from nemo.collections.asr.parts.utils.streaming_utils import AudioFeatureIterator, FrameBatchASR
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
@@ -44,7 +49,7 @@ def if_none_get_default(param, default_value):
     return (param, default_value)[param is None]
 
 
-class WERBPE_TS(WERBPE):
+class WERBPE_TS(WER):
     """
     This is WERBPE_TS class that is modified for generating word_timestamps with logits.
     The functions in WER class is modified to save the word_timestamps whenever BPE token
@@ -192,7 +197,9 @@ class WER_TS(WER):
         return token_list, timestamp_list
 
     def ctc_decoder_predictions_tensor_with_ts(
-        self, predictions: torch.Tensor, predictions_len: torch.Tensor = None,
+        self,
+        predictions: torch.Tensor,
+        predictions_len: torch.Tensor = None,
     ) -> List[str]:
         """
         A shortened version of the original function ctc_decoder_predictions_tensor().
@@ -281,7 +288,9 @@ class FrameBatchASRLogits(FrameBatchASR):
             del predictions
 
     def transcribe_with_ts(
-        self, tokens_per_chunk: int, delay: int,
+        self,
+        tokens_per_chunk: int,
+        delay: int,
     ):
         self.infer_logits()
         self.unmerged = []
@@ -430,10 +439,12 @@ class ASRDecoderTimeStamps:
         )
 
         with torch.cuda.amp.autocast():
-            transcript_logits_list = asr_model.transcribe(
-                self.audio_file_list, batch_size=self.asr_batch_size, logprobs=True
-            )
+            transcript_hyps_list = asr_model.transcribe(
+                self.audio_file_list, batch_size=self.asr_batch_size, return_hypotheses=True
+            )  # type: List[nemo_asr.parts.Hypothesis]
+            transcript_logits_list = [hyp.alignments for hyp in transcript_hyps_list]
             for idx, logit_np in enumerate(transcript_logits_list):
+                logit_np = logit_np.cpu().numpy()
                 uniq_id = get_uniqname_from_filepath(self.audio_file_list[idx])
                 if self.beam_search_decoder:
                     logging.info(
@@ -556,10 +567,12 @@ class ASRDecoderTimeStamps:
         )
 
         with torch.cuda.amp.autocast():
-            transcript_logits_list = asr_model.transcribe(
-                self.audio_file_list, batch_size=self.asr_batch_size, logprobs=True
-            )
+            transcript_hyps_list = asr_model.transcribe(
+                self.audio_file_list, batch_size=self.asr_batch_size, return_hypotheses=True
+            )  # type: List[nemo_asr.parts.Hypothesis]
+            transcript_logits_list = [hyp.alignments for hyp in transcript_hyps_list]
             for idx, logit_np in enumerate(transcript_logits_list):
+                log_prob = logit_np.cpu().numpy()
                 uniq_id = get_uniqname_from_filepath(self.audio_file_list[idx])
                 if self.beam_search_decoder:
                     logging.info(
@@ -711,7 +724,10 @@ class ASRDecoderTimeStamps:
         elif len(spaces_in_sec) > 0:
             # word_timetamps_middle should be an empty list if len(spaces_in_sec) == 1.
             word_timetamps_middle = [
-                [round(spaces_in_sec[k][1], 2), round(spaces_in_sec[k + 1][0], 2),]
+                [
+                    round(spaces_in_sec[k][1], 2),
+                    round(spaces_in_sec[k + 1][0], 2),
+                ]
                 for k in range(len(spaces_in_sec) - 1)
             ]
             word_timestamps = (

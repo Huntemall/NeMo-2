@@ -311,8 +311,10 @@ class ASRWithTTSModel(ASRModel):
                 )
             )
         else:
+            cfg = copy.deepcopy(cfg)  # copy to avoid modifying original config
             cfg.tts_model_path = f"{tts_model_path}"
             cfg.asr_model_path = f"{asr_model_path}"
+            cfg.enhancer_model_path = f"{enhancer_model_path}" if enhancer_model_path is not None else None
         return ASRWithTTSModel(cfg, trainer=trainer)
 
     def __setattr__(self, name, value):
@@ -347,9 +349,9 @@ class ASRWithTTSModel(ASRModel):
         """Test epoch end hook for ASR model"""
         return self.asr_model.multi_test_epoch_end(outputs=outputs, dataloader_idx=dataloader_idx)
 
-    def transcribe(self, paths2audio_files: List[str], batch_size: int = 4, verbose: bool = True) -> List[str]:
+    def transcribe(self, audio: List[str], batch_size: int = 4, verbose: bool = True) -> List[str]:
         """Transcribe audio data using ASR model"""
-        return self.asr_model.transcribe(paths2audio_files=paths2audio_files, batch_size=batch_size, verbose=verbose)
+        return self.asr_model.transcribe(audio=audio, batch_size=batch_size, verbose=verbose)
 
     def setup_multiple_validation_data(self, val_data_config: Union[DictConfig, Dict]):
         """Setup multiple validation data for ASR model"""
@@ -369,19 +371,20 @@ class ASRWithTTSModel(ASRModel):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """Validation step, forward to ASR model"""
-        return self.asr_model.validation_step(batch=batch, batch_idx=batch_idx, dataloader_idx=dataloader_idx)
+        loss = self.asr_model.validation_step(batch=batch, batch_idx=batch_idx, dataloader_idx=dataloader_idx)
+        if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
+            self.validation_step_outputs[dataloader_idx].append(loss)
+        else:
+            self.validation_step_outputs.append(loss)
+        return loss
 
-    def validation_epoch_end(
-        self, outputs: Union[List[Dict[str, torch.Tensor]], List[List[Dict[str, torch.Tensor]]]]
-    ) -> Optional[Dict[str, Dict[str, torch.Tensor]]]:
+    def on_validation_epoch_end(self) -> Optional[Dict[str, Dict[str, torch.Tensor]]]:
         """Validation epoch end hook, forward to ASR model"""
-        return self.asr_model.validation_epoch_end(outputs=outputs)
+        return self.asr_model.on_validation_epoch_end()
 
-    def test_epoch_end(
-        self, outputs: Union[List[Dict[str, torch.Tensor]], List[List[Dict[str, torch.Tensor]]]]
-    ) -> Optional[Dict[str, Dict[str, torch.Tensor]]]:
+    def on_test_epoch_end(self) -> Optional[Dict[str, Dict[str, torch.Tensor]]]:
         """Test epoch end hook, forward to ASR model"""
-        return self.asr_model.test_epoch_end(outputs=outputs)
+        return self.asr_model.on_test_epoch_end()
 
     def val_dataloader(self):
         """Get valudation dataloader from ASR model"""

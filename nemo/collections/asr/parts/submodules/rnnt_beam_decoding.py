@@ -101,38 +101,39 @@ class BeamRNNTInfer(Typing):
             Must be one of ['beam', 'tsd', 'alsd']. 'nsc' is currently not supported.
 
             Algoritm used:
-            `beam` - basic beam search strategy. Larger beams generally result in better decoding,
-                however the time required for the search also grows steadily.
 
-            `tsd` - time synchronous decoding. Please refer to the paper:
-                [Alignment-Length Synchronous Decoding for RNN Transducer](https://ieeexplore.ieee.org/document/9053040)
-                for details on the algorithm implemented.
+                `beam` - basic beam search strategy. Larger beams generally result in better decoding,
+                    however the time required for the search also grows steadily.
 
-                Time synchronous decoding (TSD) execution time grows by the factor T * max_symmetric_expansions.
-                For longer sequences, T is greater, and can therefore take a long time for beams to obtain
-                good results. This also requires greater memory to execute.
+                `tsd` - time synchronous decoding. Please refer to the paper:
+                    [Alignment-Length Synchronous Decoding for RNN Transducer](https://ieeexplore.ieee.org/document/9053040)
+                    for details on the algorithm implemented.
 
-            `alsd` - alignment-length synchronous decoding. Please refer to the paper:
-                [Alignment-Length Synchronous Decoding for RNN Transducer](https://ieeexplore.ieee.org/document/9053040)
-                for details on the algorithm implemented.
+                    Time synchronous decoding (TSD) execution time grows by the factor T * max_symmetric_expansions.
+                    For longer sequences, T is greater, and can therefore take a long time for beams to obtain
+                    good results. This also requires greater memory to execute.
 
-                Alignment-length synchronous decoding (ALSD) execution time is faster than TSD, with growth
-                factor of T + U_max, where U_max is the maximum target length expected during execution.
+                `alsd` - alignment-length synchronous decoding. Please refer to the paper:
+                    [Alignment-Length Synchronous Decoding for RNN Transducer](https://ieeexplore.ieee.org/document/9053040)
+                    for details on the algorithm implemented.
 
-                Generally, T + U_max < T * max_symmetric_expansions. However, ALSD beams are non-unique,
-                therefore it is required to use larger beam sizes to achieve the same (or close to the same)
-                decoding accuracy as TSD.
+                    Alignment-length synchronous decoding (ALSD) execution time is faster than TSD, with growth
+                    factor of T + U_max, where U_max is the maximum target length expected during execution.
 
-                For a given decoding accuracy, it is possible to attain faster decoding via ALSD than TSD.
+                    Generally, T + U_max < T * max_symmetric_expansions. However, ALSD beams are non-unique,
+                    therefore it is required to use larger beam sizes to achieve the same (or close to the same)
+                    decoding accuracy as TSD.
 
-            `maes` = modified adaptive expansion searcn. Please refer to the paper:
-                [Accelerating RNN Transducer Inference via Adaptive Expansion Search](https://ieeexplore.ieee.org/document/9250505)
+                    For a given decoding accuracy, it is possible to attain faster decoding via ALSD than TSD.
 
-                Modified Adaptive Synchronous Decoding (mAES) execution time is adaptive w.r.t the
-                number of expansions (for tokens) required per timestep. The number of expansions can usually
-                be constrained to 1 or 2, and in most cases 2 is sufficient.
+                `maes` = modified adaptive expansion searcn. Please refer to the paper:
+                    [Accelerating RNN Transducer Inference via Adaptive Expansion Search](https://ieeexplore.ieee.org/document/9250505)
 
-                This beam search technique can possibly obtain superior WER while sacrificing some evaluation time.
+                    Modified Adaptive Synchronous Decoding (mAES) execution time is adaptive w.r.t the
+                    number of expansions (for tokens) required per timestep. The number of expansions can usually
+                    be constrained to 1 or 2, and in most cases 2 is sufficient.
+
+                    This beam search technique can possibly obtain superior WER while sacrificing some evaluation time.
 
         score_norm: bool, whether to normalize the scores of the log probabilities.
 
@@ -200,8 +201,7 @@ class BeamRNNTInfer(Typing):
 
     @property
     def input_types(self):
-        """Returns definitions of module input ports.
-        """
+        """Returns definitions of module input ports."""
         return {
             "encoder_output": NeuralType(('B', 'D', 'T'), AcousticEncodedRepresentation()),
             "encoded_lengths": NeuralType(tuple('B'), LengthsType()),
@@ -210,8 +210,7 @@ class BeamRNNTInfer(Typing):
 
     @property
     def output_types(self):
-        """Returns definitions of module output ports.
-        """
+        """Returns definitions of module output ports."""
         return {"predictions": [NeuralType(elements_type=HypothesisType())]}
 
     def __init__(
@@ -368,7 +367,7 @@ class BeamRNNTInfer(Typing):
             return_hat_ilm_default = self.joint.return_hat_ilm
             self.joint.return_hat_ilm = self.hat_subtract_ilm
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Apply optional preprocessing
             encoder_output = encoder_output.transpose(1, 2)  # (B, T, D)
 
@@ -383,38 +382,34 @@ class BeamRNNTInfer(Typing):
                 unit='sample',
             ) as idx_gen:
 
-                # Freeze the decoder and joint to prevent recording of gradients
-                # during the beam loop.
-                with self.decoder.as_frozen(), self.joint.as_frozen():
+                _p = next(self.joint.parameters())
+                dtype = _p.dtype
 
-                    _p = next(self.joint.parameters())
-                    dtype = _p.dtype
+                # Decode every sample in the batch independently.
+                for batch_idx in idx_gen:
+                    inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
+                    logitlen = encoded_lengths[batch_idx]
 
-                    # Decode every sample in the batch independently.
-                    for batch_idx in idx_gen:
-                        inseq = encoder_output[batch_idx : batch_idx + 1, : encoded_lengths[batch_idx], :]  # [1, T, D]
-                        logitlen = encoded_lengths[batch_idx]
+                    if inseq.dtype != dtype:
+                        inseq = inseq.to(dtype=dtype)
 
-                        if inseq.dtype != dtype:
-                            inseq = inseq.to(dtype=dtype)
+                    # Extract partial hypothesis if exists
+                    partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
 
-                        # Extract partial hypothesis if exists
-                        partial_hypothesis = partial_hypotheses[batch_idx] if partial_hypotheses is not None else None
+                    # Execute the specific search strategy
+                    nbest_hyps = self.search_algorithm(
+                        inseq, logitlen, partial_hypotheses=partial_hypothesis
+                    )  # sorted list of hypothesis
 
-                        # Execute the specific search strategy
-                        nbest_hyps = self.search_algorithm(
-                            inseq, logitlen, partial_hypotheses=partial_hypothesis
-                        )  # sorted list of hypothesis
+                    # Prepare the list of hypotheses
+                    nbest_hyps = pack_hypotheses(nbest_hyps)
 
-                        # Prepare the list of hypotheses
-                        nbest_hyps = pack_hypotheses(nbest_hyps)
-
-                        # Pack the result
-                        if self.return_best_hypothesis:
-                            best_hypothesis = nbest_hyps[0]  # type: Hypothesis
-                        else:
-                            best_hypothesis = NBestHypotheses(nbest_hyps)  # type: NBestHypotheses
-                        hypotheses.append(best_hypothesis)
+                    # Pack the result
+                    if self.return_best_hypothesis:
+                        best_hypothesis = nbest_hyps[0]  # type: Hypothesis
+                    else:
+                        best_hypothesis = NBestHypotheses(nbest_hyps)  # type: NBestHypotheses
+                    hypotheses.append(best_hypothesis)
 
         self.decoder.train(decoder_training_state)
         self.joint.train(joint_training_state)
@@ -638,7 +633,10 @@ class BeamRNNTInfer(Typing):
 
                 # keep those hypothesis that have scores greater than next search generation
                 hyps_max = float(max(hyps, key=lambda x: x.score).score)
-                kept_most_prob = sorted([hyp for hyp in kept_hyps if hyp.score > hyps_max], key=lambda x: x.score,)
+                kept_most_prob = sorted(
+                    [hyp for hyp in kept_hyps if hyp.score > hyps_max],
+                    key=lambda x: x.score,
+                )
 
                 # If enough hypothesis have scores greater than next search generation,
                 # stop beam search.
