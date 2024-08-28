@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
-from omegaconf.dictconfig import DictConfig
+from omegaconf import DictConfig, ListConfig
 from pkg_resources import packaging
 from pytorch_lightning.trainer.trainer import Trainer
 from transformers import CLIPVisionModel, SiglipVisionModel
@@ -38,6 +38,10 @@ from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron
     MegatronCLIPModel,
 )
 from nemo.collections.multimodal.parts.utils import create_image_processor, load_nemo_model_weights
+from nemo.collections.nlp.data.language_modeling.megatron.base_dataset_utils import (
+    get_datasets_weights_and_num_samples,
+)
+from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset import BlendableDataset
 from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import MegatronPretrainingSampler
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_model import GPTModel
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel, get_specs
@@ -67,8 +71,9 @@ from nemo.utils import logging
 
 try:
     from megatron.core import InferenceParams, dist_checkpointing, parallel_state, tensor_parallel
+    from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+    from megatron.core.dist_checkpointing.mapping import LocalNonpersitentObject, ShardedObject
     from megatron.core.models.gpt import GPTModel as MCoreGPTModel
-    from megatron.core.num_microbatches_calculator import get_num_microbatches
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
@@ -77,6 +82,19 @@ try:
 except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
+
+try:
+    from megatron.core.num_microbatches_calculator import get_num_microbatches
+
+except (ImportError, ModuleNotFoundError):
+    logging.warning("Megatron num_microbatches_calculator not found, using Apex version.")
+    from apex.transformer.pipeline_parallel.utils import get_num_microbatches
+
+
+def skip_fp8_load(x):
+    if isinstance(x, ShardedObject) and 'fused_attention' in x.key and '_extra_state' in x.key:
+        x = LocalNonpersitentObject(x.data)  # use the FP8 state from initialization, not from ckpt
+    return x
 
 
 class FrozenCLIPVisionTransformer(CLIPVisionTransformer):
@@ -387,8 +405,8 @@ class LitaWordEmbeddingMixin(NevaWordEmbeddingMixin):
                 t_token_start, t_token_end = start, start + T
                 s_token_start, s_token_end = start + T, start + T + M
                 assert s_token_end == end + 1, "Token replacement error"
-                inputs_embeds[idx, t_token_start:t_token_end] = temporal_tokens[idx]
-                inputs_embeds[idx, s_token_start:s_token_end] = spatial_tokens[idx]
+                inputs_embeds[idx, t_token_start:t_token_end] = t_tokens[idx]
+                inputs_embeds[idx, s_token_start:s_token_end] = s_tokens[idx]
             elif self.visual_token_format == 'im_vid_start_end':  # v1.5 lita
                 if not self.use_media_start_end:
                     # replace the media start and media end embedding with
@@ -470,11 +488,10 @@ class NevaBaseModel:
     def create_vision_encoder_and_processor(self, mm_cfg):
         # Initialize vision encoder and freeze it
         if mm_cfg.vision_encoder.get("from_hf", False):
-            if (
-                "clip" in mm_cfg.vision_encoder.from_pretrained
-                or "vit" in mm_cfg.vision_encoder.from_pretrained
-                or "clip" in mm_cfg.vision_encoder.get("model_type", "")
-            ):
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(mm_cfg.vision_encoder.from_pretrained)
+            if config.architectures[0] == "CLIPVisionModel" or config.architectures[0] == "CLIPModel":
                 vision_encoder = CLIPVisionModel.from_pretrained(
                     mm_cfg.vision_encoder.from_pretrained,
                     torch_dtype=torch.bfloat16,
@@ -484,9 +501,7 @@ class NevaBaseModel:
                     for param in vision_encoder.parameters():
                         param.requires_grad = False
                     vision_encoder = vision_encoder.eval()
-            elif "siglip" in mm_cfg.vision_encoder.from_pretrained or "siglip" in mm_cfg.vision_encoder.get(
-                "model_type", ""
-            ):
+            elif config.architectures[0] == "SiglipVisionModel" or config.architectures[0] == "SiglipModel":
                 vision_encoder = SiglipVisionModel.from_pretrained(
                     mm_cfg.vision_encoder.from_pretrained,
                     torch_dtype=torch.bfloat16,
@@ -521,6 +536,9 @@ class NevaBaseModel:
         sharded_state_dict = None
         if getattr(self, "sharded_state_dict", None) is not None:
             sharded_state_dict = self.sharded_state_dict(prefix="model.")
+        # WAR: This is a temporary fix to skip loading FP8 parameters for Dot Product Attention
+        # TODO(yuya): Check if this skip affecting fp8 native checkpoints loading
+        dict_list_map_inplace(skip_fp8_load, sharded_state_dict)
         state_dict, self.is_dist_ckpt = load_nemo_model_weights(nemo_path, sharded_state_dict)
 
         return state_dict
@@ -731,8 +749,7 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                 config=self.transformer_config,
                 transformer_layer_spec=get_specs(
                     self.spec_name,
-                    self.transformer_config.num_moe_experts,
-                    self.transformer_config.moe_grouped_gemm,
+                    self.transformer_config,
                     self.transformer_engine,
                 ),
                 vocab_size=self.cfg.get('override_vocab_size', self.padded_vocab_size),
@@ -1069,9 +1086,10 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
                 inference_max_sequence_len,
             ) = batch
             tokens = tokens.cuda()
-            attention_mask = attention_mask.cuda()
             position_ids = position_ids.cuda()
-            attention_mask = attention_mask[0:1]
+            if attention_mask != None:
+                attention_mask = attention_mask.cuda()
+                attention_mask = attention_mask[0:1]
             if media is not None:
                 media = media.cuda()
             labels = None
@@ -1228,15 +1246,132 @@ class MegatronNevaModel(MultimodalAdapterModelMixin, MegatronGPTModel):
         if self.cfg.get('transformer_engine', False):
             self.setup_transformer_engine_tp_groups()
 
+    def build_train_valid_test_datasets_blend(self):
+        logging.info('Building Blending Neva datasets.')
+
+        train_datasets = []
+        valid_datasets = []
+
+        data_cfg = self.cfg.data
+        is_packed_sequence = data_cfg.get("packed_sequence", False)
+
+        if is_packed_sequence:
+            assert self.cfg.micro_batch_size == 1, "Micro batch size must be 1 if using packed sequence"
+
+        # Check if concat_sampling_probabilities is properly set
+        if data_cfg.get('concat_sampling_probabilities') is None or not isinstance(
+            data_cfg.concat_sampling_probabilities, ListConfig
+        ):
+            raise ValueError(
+                "concat_sampling_probabilities must be a ListConfig with the same number of entries as data_path."
+            )
+
+        if len(data_cfg.concat_sampling_probabilities) != len(data_cfg.data_path):
+            raise ValueError(
+                f"concat_sampling_probabilities must be of the same size as number of files from data path. "
+                f"Provided size {len(data_cfg.concat_sampling_probabilities)}, number of datasets {len(data_cfg.data_path)}"
+            )
+
+        for each_file_from_path in data_cfg.data_path:
+            if is_packed_sequence:
+                train_dataset = NevaPackedSeqDatatset(
+                    each_file_from_path, self.cfg.mm_cfg.vision_encoder.get("crop_size")
+                )
+                valid_dataset = NevaPackedSeqDatatset(
+                    each_file_from_path, self.cfg.mm_cfg.vision_encoder.get("crop_size")
+                )
+            else:
+                ds_dict = make_supervised_data_module(
+                    tokenizer=self.tokenizer,
+                    image_processor=(
+                        self.model.module.image_processor
+                        if hasattr(self.model, "module")
+                        else self.model.image_processor
+                    ),
+                    model_cfg=self.cfg,
+                    each_file_from_path=each_file_from_path,
+                )
+                train_dataset = ds_dict["train_dataset"]
+                valid_dataset = ds_dict["eval_dataset"]
+
+            train_datasets.append(train_dataset)
+            valid_datasets.append(valid_dataset)
+
+        # Create BlendableDataset for training
+        if self.trainer.max_steps is None or self.trainer.max_steps <= 0:
+            raise ValueError(f'Trainer max_steps must be set to a positive integer. Found {self.trainer.max_steps}')
+
+        num_train_samples = self.trainer.max_steps * data_cfg.global_batch_size
+        _, _, num_train_samples_per_dataset = get_datasets_weights_and_num_samples(
+            data_prefix=[
+                weight for pair in zip(data_cfg.concat_sampling_probabilities, data_cfg.data_path) for weight in pair
+            ],
+            num_samples=[num_train_samples],
+        )
+        num_train_samples_after_blend = sum([x[0] for x in num_train_samples_per_dataset])
+
+        logging.info(f"Number of train datasets: {len(train_datasets)}")
+        logging.info(f"Lengths of train datasets: {[len(ds) for ds in train_datasets]}")
+        logging.info(f"Number of train datasets after blending: {num_train_samples_after_blend}")
+
+        if is_packed_sequence:
+            num_train_samples_after_blend = sum([len(ds) for ds in train_datasets])
+
+        self._train_ds = BlendableDataset(
+            datasets=train_datasets, weights=data_cfg.concat_sampling_probabilities, size=num_train_samples_after_blend
+        )
+
+        self._validation_ds = BlendableDataset(
+            datasets=valid_datasets, weights=data_cfg.concat_sampling_probabilities, size=num_train_samples_after_blend
+        )
+
+        logging.info(f'Length of train dataset: {len(self._train_ds)}')
+        logging.info(f'Length of validation dataset: {len(self._validation_ds)}')
+
+        return self._train_ds, self._validation_ds
+
     def build_train_valid_test_datasets(self):
         logging.info('Building Neva datasets.')
+
+        if isinstance(self.cfg.data.data_path, (list, ListConfig)):
+            if len(self.cfg.data.data_path) > 1:
+                # Only consider data blending if there are multiple dataset paths
+                if self.cfg.data.get('concat_sampling_probabilities') is None:
+                    logging.warning("No sampling probabilities provided. Defaulting to uniform sampling.")
+                    self.cfg.data.concat_sampling_probabilities = [1 / len(self.cfg.data.data_path)] * len(
+                        self.cfg.data.data_path
+                    )
+                else:
+                    # Normalize the sampling probabilities if they don't sum to 1
+                    total = sum(self.cfg.data.concat_sampling_probabilities)
+                    if total != 1:
+                        logging.warning(f"Concat_sampling_probabilities sum to {total}. Normalizing to sum to 1.")
+                        self.cfg.data.concat_sampling_probabilities = [
+                            prob / total for prob in self.cfg.data.concat_sampling_probabilities
+                        ]
+                return self.build_train_valid_test_datasets_blend()
+            elif len(self.cfg.data.data_path) == 1:
+                if self.cfg.data.concat_sampling_probabilities is not None:
+                    logging.warning(
+                        "Using sampling probabilities with a single dataset has no effect. Defaulting to None and not using blend dataset."
+                    )
+                    self.cfg.data.concat_sampling_probabilities = None
+                self.cfg.data.data_path = self.cfg.data.data_path[0]
+            else:
+                raise ValueError("data_path must contain at least one valid path.")
+        elif isinstance(self.cfg.data.data_path, str):
+            pass
+        else:
+            raise TypeError("data_path must be a list of paths or a single string")
+
         if self.cfg.data.get("packed_sequence", False):
             assert self.cfg.micro_batch_size == 1, "Micro batch size must be 1 if using packed sequence"
+
             self._train_ds = NevaPackedSeqDatatset(
-                self.cfg.data.data_prefix, self.cfg.mm_cfg.vision_encoder.get("crop_size")
+                self.cfg.data.data_path, self.cfg.mm_cfg.vision_encoder.get("crop_size")
             )
             self._validation_ds = NevaPackedSeqDatatset(
-                self.cfg.data.data_prefix, self.cfg.mm_cfg.vision_encoder.get("crop_size")
+                self.cfg.data.data_path, self.cfg.mm_cfg.vision_encoder.get("crop_size")
             )
         else:
             ds_dict = make_supervised_data_module(
